@@ -1,0 +1,3848 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Angel <achaparro@lifeisthegame.email>
+Date: Tue, 23 Sep 2025 22:21:28 -0500
+Subject: [PATCH] First Herculi
+
+
+diff --git a/src/main/java/io/multipaper/herculi/Herculi.java b/src/main/java/io/multipaper/herculi/Herculi.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..d77af9b535186cace5a65d187983e4b8e9f0dccf
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/Herculi.java
+@@ -0,0 +1,51 @@
++package io.multipaper.herculi;
++
++import net.minecraft.world.entity.Entity;
++import net.minecraft.core.BlockPos;
++import net.minecraft.world.level.Level;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.level.ChunkPos;
++import java.util.Objects;
++import java.util.concurrent.CompletableFuture;
++import java.util.function.Consumer;
++
++/**
++ * Temporary helper shims to allow early call sites to compile.
++ * These are NO-OP placeholders and will be replaced with proper
++ * region-aware execution in later phases.
++ */
++public final class Herculi {
++
++    private Herculi() {}
++
++    public static void ensureSync(Entity entity, Runnable task) {
++        Objects.requireNonNull(task, "task").run();
++    }
++
++    public static void ensureSync(Entity entity, Consumer<Entity> consumer) {
++        Objects.requireNonNull(consumer, "consumer").accept(entity);
++    }
++
++    public static void ensureSync(Level level, BlockPos pos, Runnable task) {
++        Objects.requireNonNull(task, "task").run();
++    }
++
++    public static <T> CompletableFuture<T> runSync(Level level, BlockPos pos, CompletableFuture<T> future) {
++        return future; // pass-through for now
++    }
++
++    /**
++     * Optional prefetch hook for chunk I/O. Safe no-op when disabled. Intended to be called from
++     * early, low-risk anchors (e.g., ticketing) to warm up chunk data without impacting behavior.
++     */
++    public static void maybePrefetchChunk(final ServerLevel level, final ChunkPos pos) {
++        if (level == null || pos == null) return;
++        if (!io.multipaper.herculi.config.HerculiConfig.instance().threadingEnabled()) return;
++        if (!io.multipaper.herculi.config.HerculiConfig.instance().chunkIoEnabled()) return;
++        try {
++            io.multipaper.herculi.chunk.HerculiChunkPipeline.instance().prefetchChunk(level, pos);
++        } catch (Throwable ignored) {
++            // keep call sites resilient; prefetch is best-effort only
++        }
++    }
++}
+diff --git a/src/main/java/io/multipaper/herculi/api/BukkitThreadGuard.java b/src/main/java/io/multipaper/herculi/api/BukkitThreadGuard.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..33ee50c3dc2150a2b6dd612d4ccaf61339bec496
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/api/BukkitThreadGuard.java
+@@ -0,0 +1,22 @@
++package io.multipaper.herculi.api;
++
++/**
++ * Lightweight, gated main-thread guard for Bukkit API entrypoints.
++ * Does not throw; only logs when guardrails are enabled.
++ */
++public final class BukkitThreadGuard {
++    private BukkitThreadGuard() {}
++
++    public static void ensureMainThread(String apiName) {
++        try {
++            if (!io.multipaper.herculi.config.HerculiConfig.instance().guardrailsEnabled()) return;
++            final net.minecraft.server.MinecraftServer srv = net.minecraft.server.MinecraftServer.getServer();
++            final boolean onMain = (srv == null) || srv.isSameThread();
++            if (!onMain) {
++                org.bukkit.Bukkit.getLogger().warning("[Herculi] Bukkit API off-main thread: " + (apiName == null ? "unknown" : apiName));
++            }
++        } catch (Throwable ignored) {
++            // Best effort only
++        }
++    }
++}
+diff --git a/src/main/java/io/multipaper/herculi/broadcast/BroadcastManager.java b/src/main/java/io/multipaper/herculi/broadcast/BroadcastManager.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..3e5c899ad4d8ed27b55dda5f6af03a3d5749789f
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/broadcast/BroadcastManager.java
+@@ -0,0 +1,118 @@
++package io.multipaper.herculi.broadcast;
++
++import io.multipaper.herculi.config.HerculiConfig;
++import net.minecraft.network.Connection;
++import net.minecraft.network.protocol.Packet;
++import net.minecraft.network.protocol.game.ClientboundSectionBlocksUpdatePacket;
++import net.minecraft.server.level.ServerPlayer;
++
++import java.util.Map;
++import java.lang.ref.WeakReference;
++import java.util.Objects;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ConcurrentLinkedQueue;
++import java.util.concurrent.atomic.AtomicLong;
++
++/**
++ * Minimal, gated broadcasting manager inspired by ShreddedPaper 0028.
++ *
++ * Current behavior when enabled:
++ * - Coalesce and queue section block update packets per-recipient.
++ * - Perform a small immediate drain with a budget to reduce packet spam.
++ *
++ * This keeps everything on the main thread for now (no thread creation), but
++ * establishes an architecture for future threaded/budgeted drains.
++ */
++public final class BroadcastManager {
++    private static final BroadcastManager INSTANCE = new BroadcastManager();
++
++    public static BroadcastManager instance() { return INSTANCE; }
++
++    private final Map<Connection, ConcurrentLinkedQueue<Packet<?>>> perRecipientQueues = new ConcurrentHashMap<>();
++    private final Map<Connection, WeakReference<ServerPlayer>> recipients = new ConcurrentHashMap<>();
++    private final AtomicLong enqueued = new AtomicLong();
++    private final AtomicLong drained = new AtomicLong();
++
++    private BroadcastManager() {}
++
++    public boolean enabled() {
++        return HerculiConfig.instance().getBoolean("broadcasting.threaded.enabled", false);
++    }
++
++    private int drainBudgetPerEnqueue() {
++        // reuse maxBatchesPerQueue as a small per-enqueue drain budget if present
++        return Math.max(1, HerculiConfig.instance().getInt("broadcasting.threaded.maxBatchesPerQueue", 16));
++    }
++
++    public void sendOrEnqueue(final ServerPlayer player, final Packet<?> packet, final String tag) {
++        if (!enabled()) {
++            player.connection.send(packet);
++            return;
++        }
++        // Only queue section block updates for now; pass-through others
++        if (!(packet instanceof ClientboundSectionBlocksUpdatePacket)) {
++            player.connection.send(packet);
++            return;
++        }
++        final Connection key = player.connection.connection;
++        final ConcurrentLinkedQueue<Packet<?>> q = perRecipientQueues.computeIfAbsent(key, k -> new ConcurrentLinkedQueue<>());
++        recipients.put(key, new WeakReference<>(player));
++        q.add(packet);
++        enqueued.incrementAndGet();
++        // Small immediate drain on the same thread (assumed main) to cap growth
++        int budget = drainBudgetPerEnqueue();
++        Packet<?> p;
++        while (budget-- > 0 && (p = q.poll()) != null) {
++            player.connection.send(p);
++            drained.incrementAndGet();
++        }
++        // If queue still has items, it will be drained by subsequent enqueues; a periodic ticker can be added later.
++    }
++
++    public void drainFor(final ServerPlayer player, final int budget) {
++        if (!enabled()) return;
++        final Connection key = player.connection.connection;
++        final ConcurrentLinkedQueue<Packet<?>> q = perRecipientQueues.get(key);
++        if (q == null || q.isEmpty()) return;
++        int b = Math.max(1, budget);
++        Packet<?> p;
++        while (b-- > 0 && (p = q.poll()) != null) {
++            player.connection.send(p);
++            drained.incrementAndGet();
++        }
++        if (q.isEmpty()) perRecipientQueues.remove(key, q);
++    }
++
++    public int drainAll(int maxPerRecipient) {
++        if (!enabled()) return 0;
++        int sent = 0;
++        for (Map.Entry<Connection, ConcurrentLinkedQueue<Packet<?>>> e : perRecipientQueues.entrySet()) {
++            final Connection key = e.getKey();
++            final ConcurrentLinkedQueue<Packet<?>> q = e.getValue();
++            final WeakReference<ServerPlayer> ref = recipients.get(key);
++            final ServerPlayer player = ref != null ? ref.get() : null;
++            if (player == null || player.connection == null) {
++                // drop queue if player is gone
++                perRecipientQueues.remove(key);
++                recipients.remove(key);
++                continue;
++            }
++            int budget = Math.max(1, maxPerRecipient);
++            Packet<?> p;
++            while (budget-- > 0 && (p = q.poll()) != null) {
++                player.connection.send(p);
++                sent++;
++                drained.incrementAndGet();
++            }
++            if (q.isEmpty()) {
++                perRecipientQueues.remove(key, q);
++                recipients.remove(key);
++            }
++        }
++        return sent;
++    }
++
++    public long getEnqueued() { return enqueued.get(); }
++    public long getDrained() { return drained.get(); }
++    public int getApproxQueueCount() { return perRecipientQueues.size(); }
++}
+diff --git a/src/main/java/io/multipaper/herculi/broadcast/BroadcastMetrics.java b/src/main/java/io/multipaper/herculi/broadcast/BroadcastMetrics.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..0e621075aa2e4673fd2a1eeae4275d681c6b2495
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/broadcast/BroadcastMetrics.java
+@@ -0,0 +1,23 @@
++package io.multipaper.herculi.broadcast;
++
++import java.util.concurrent.atomic.AtomicLong;
++
++/**
++ * Minimal metrics scaffold for threaded broadcasting (default-off).
++ * Safe to reference from anywhere; no external deps.
++ */
++public final class BroadcastMetrics {
++    private BroadcastMetrics() {}
++
++    public static final AtomicLong activeQueues = new AtomicLong();
++    public static final AtomicLong enqueuedBatches = new AtomicLong();
++    public static final AtomicLong dequeuedBatches = new AtomicLong();
++    public static final AtomicLong droppedBatchesOverflow = new AtomicLong();
++    public static final AtomicLong droppedBatchesTimeout = new AtomicLong();
++
++    public static long getActiveQueues() { return activeQueues.get(); }
++    public static long getEnqueuedBatches() { return enqueuedBatches.get(); }
++    public static long getDequeuedBatches() { return dequeuedBatches.get(); }
++    public static long getDroppedBatchesOverflow() { return droppedBatchesOverflow.get(); }
++    public static long getDroppedBatchesTimeout() { return droppedBatchesTimeout.get(); }
++}
+diff --git a/src/main/java/io/multipaper/herculi/broadcast/BroadcastRegistry.java b/src/main/java/io/multipaper/herculi/broadcast/BroadcastRegistry.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..93f3e76e3d50a60d9032b0d9ba20e19b6e926b7f
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/broadcast/BroadcastRegistry.java
+@@ -0,0 +1,33 @@
++package io.multipaper.herculi.broadcast;
++
++import java.util.Objects;
++
++/**
++ * Global access to the broadcasting queue manager. In production this would be
++ * constructed from configuration and lifecycle-managed during server start/stop.
++ * For now, it's a simple holder (default-off wiring expected by caller).
++ */
++public final class BroadcastRegistry {
++    private BroadcastRegistry() {}
++
++    private static volatile RecipientQueueManager manager;
++    private static volatile boolean enabled;
++    private static volatile int drainBudget = 64;
++
++    public static void init(boolean isEnabled, int maxQueuesTotal, int maxBatchesPerQueue, RecipientQueue.DropPolicy dropPolicy, int drainBudgetPerTick) {
++        enabled = isEnabled;
++        drainBudget = Math.max(1, drainBudgetPerTick);
++        manager = new RecipientQueueManager(maxQueuesTotal, maxBatchesPerQueue, dropPolicy);
++    }
++
++    public static RecipientQueueManager manager() {
++        return Objects.requireNonNullElseGet(manager, () -> {
++            // lazy default (very conservative)
++            manager = new RecipientQueueManager(1024, 32, RecipientQueue.DropPolicy.DROP);
++            return manager;
++        });
++    }
++
++    public static boolean enabled() { return enabled; }
++    public static int drainBudget() { return drainBudget; }
++}
+diff --git a/src/main/java/io/multipaper/herculi/broadcast/RecipientQueue.java b/src/main/java/io/multipaper/herculi/broadcast/RecipientQueue.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..ce071eb2f543d4352e899c56903b2613fde50738
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/broadcast/RecipientQueue.java
+@@ -0,0 +1,86 @@
++package io.multipaper.herculi.broadcast;
++
++import net.minecraft.network.protocol.Packet;
++
++import java.util.ArrayDeque;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Objects;
++import java.util.concurrent.atomic.AtomicInteger;
++
++/**
++ * Bounded per-recipient, per-(world,chunk) queue for packet batches.
++ * Default-off scaffolding; no runtime wiring yet.
++ */
++public final class RecipientQueue {
++    public enum DropPolicy { COALESCE, FALLBACK_TO_MAIN, DROP }
++
++    public static final class RecipientBatch {
++        public final List<Packet<?>> packets;
++        public final long createdAtNanos;
++        public RecipientBatch(List<Packet<?>> packets) {
++            this.packets = packets == null ? List.of() : List.copyOf(packets);
++            this.createdAtNanos = System.nanoTime();
++        }
++        public static RecipientBatch single(Packet<?> pkt) {
++            return new RecipientBatch(java.util.List.of(pkt));
++        }
++    }
++
++    private final RecipientQueueKey key;
++    private final ArrayDeque<RecipientBatch> deque;
++    private final int maxBatches;
++    private final DropPolicy dropPolicy;
++    private final AtomicInteger size = new AtomicInteger();
++
++    public RecipientQueue(RecipientQueueKey key, int maxBatches, DropPolicy dropPolicy) {
++        this.key = Objects.requireNonNull(key, "key");
++        this.deque = new ArrayDeque<>(Math.max(1, maxBatches));
++        this.maxBatches = Math.max(1, maxBatches);
++        this.dropPolicy = dropPolicy == null ? DropPolicy.DROP : dropPolicy;
++    }
++
++    public RecipientQueueKey key() { return key; }
++
++    public int size() { return size.get(); }
++
++    public boolean isEmpty() { return size() == 0; }
++
++    /** Offer a batch; returns true if enqueued, false if dropped. */
++    public boolean offer(RecipientBatch batch) {
++        if (batch == null) return true; // nothing to enqueue
++        synchronized (deque) {
++            if (deque.size() >= maxBatches) {
++                switch (dropPolicy) {
++                    case COALESCE:
++                        // Simple coalesce: drop oldest to make room for newest
++                        deque.pollFirst();
++                        BroadcastMetrics.droppedBatchesOverflow.incrementAndGet();
++                        break;
++                    case FALLBACK_TO_MAIN:
++                        // For scaffolding, treat same as DROP (actual fallback will be handled by caller)
++                    case DROP:
++                    default:
++                        BroadcastMetrics.droppedBatchesOverflow.incrementAndGet();
++                        return false;
++                }
++            }
++            deque.addLast(batch);
++            size.incrementAndGet();
++            BroadcastMetrics.enqueuedBatches.incrementAndGet();
++            return true;
++        }
++    }
++
++    /** Poll next batch or null. */
++    public RecipientBatch poll() {
++        synchronized (deque) {
++            RecipientBatch b = deque.pollFirst();
++            if (b != null) {
++                size.decrementAndGet();
++                BroadcastMetrics.dequeuedBatches.incrementAndGet();
++            }
++            return b;
++        }
++    }
++}
+diff --git a/src/main/java/io/multipaper/herculi/broadcast/RecipientQueueKey.java b/src/main/java/io/multipaper/herculi/broadcast/RecipientQueueKey.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..ee4afdce6a849919fffd22b290248ef2d8400b6c
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/broadcast/RecipientQueueKey.java
+@@ -0,0 +1,31 @@
++package io.multipaper.herculi.broadcast;
++
++import java.util.Objects;
++import java.util.UUID;
++
++public final class RecipientQueueKey {
++    public final UUID playerUuid;
++    public final String worldKey; // dimension identifier
++    public final int chunkX;
++    public final int chunkZ;
++
++    public RecipientQueueKey(UUID playerUuid, String worldKey, int chunkX, int chunkZ) {
++        this.playerUuid = playerUuid;
++        this.worldKey = worldKey;
++        this.chunkX = chunkX;
++        this.chunkZ = chunkZ;
++    }
++
++    @Override
++    public boolean equals(Object o) {
++        if (this == o) return true;
++        if (!(o instanceof RecipientQueueKey)) return false;
++        RecipientQueueKey that = (RecipientQueueKey) o;
++        return chunkX == that.chunkX && chunkZ == that.chunkZ && Objects.equals(playerUuid, that.playerUuid) && Objects.equals(worldKey, that.worldKey);
++    }
++
++    @Override
++    public int hashCode() {
++        return Objects.hash(playerUuid, worldKey, chunkX, chunkZ);
++    }
++}
+diff --git a/src/main/java/io/multipaper/herculi/broadcast/RecipientQueueManager.java b/src/main/java/io/multipaper/herculi/broadcast/RecipientQueueManager.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..f4f2acbbb9972af346ad3c9a4715dc8cd4044fa8
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/broadcast/RecipientQueueManager.java
+@@ -0,0 +1,121 @@
++package io.multipaper.herculi.broadcast;
++
++import java.util.Objects;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ConcurrentMap;
++
++/**
++ * Registry of per-recipient queues. Default-off scaffolding.
++ */
++public final class RecipientQueueManager {
++
++    public static final class OfferResult {
++        public final boolean enqueued;
++        public final boolean dropped;
++        public final boolean createdQueue;
++        private OfferResult(boolean enqueued, boolean dropped, boolean createdQueue) {
++            this.enqueued = enqueued;
++            this.dropped = dropped;
++            this.createdQueue = createdQueue;
++        }
++        public static OfferResult enqueued(boolean created) { return new OfferResult(true, false, created); }
++        public static OfferResult dropped() { return new OfferResult(false, true, false); }
++    }
++
++    private final ConcurrentMap<RecipientQueueKey, RecipientQueue> queues = new ConcurrentHashMap<>();
++
++    private final int maxQueuesTotal;
++    private final int maxBatchesPerQueue;
++    private final RecipientQueue.DropPolicy dropPolicy;
++
++    public RecipientQueueManager(int maxQueuesTotal, int maxBatchesPerQueue, RecipientQueue.DropPolicy dropPolicy) {
++        this.maxQueuesTotal = Math.max(1, maxQueuesTotal);
++        this.maxBatchesPerQueue = Math.max(1, maxBatchesPerQueue);
++        this.dropPolicy = dropPolicy == null ? RecipientQueue.DropPolicy.DROP : dropPolicy;
++    }
++
++    public RecipientQueue getOrCreate(RecipientQueueKey key) {
++        Objects.requireNonNull(key, "key");
++        RecipientQueue existing = queues.get(key);
++        if (existing != null) return existing;
++        if (queues.size() >= maxQueuesTotal) {
++            // refuse to grow; caller must fallback
++            return null;
++        }
++        RecipientQueue created = new RecipientQueue(key, maxBatchesPerQueue, dropPolicy);
++        RecipientQueue prev = queues.putIfAbsent(key, created);
++        if (prev == null) {
++            BroadcastMetrics.activeQueues.incrementAndGet();
++            return created;
++        }
++        return prev;
++    }
++
++    public void remove(RecipientQueueKey key) {
++        RecipientQueue q = queues.remove(key);
++        if (q != null) {
++            BroadcastMetrics.activeQueues.decrementAndGet();
++        }
++    }
++
++    public OfferResult offer(RecipientQueueKey key, RecipientQueue.RecipientBatch batch) {
++        RecipientQueue q = queues.get(key);
++        boolean created = false;
++        if (q == null) {
++            q = getOrCreate(key);
++            created = q != null;
++        }
++        if (q == null) {
++            return OfferResult.dropped();
++        }
++        boolean ok = q.offer(batch);
++        return ok ? OfferResult.enqueued(created) : OfferResult.dropped();
++    }
++
++    public RecipientQueue.RecipientBatch poll(RecipientQueueKey key) {
++        RecipientQueue q = queues.get(key);
++        return q == null ? null : q.poll();
++    }
++
++    public int size() { return queues.size(); }
++
++    /** Approximate total pending batches across all queues. */
++    public int pendingSize() {
++        int total = 0;
++        for (RecipientQueue q : queues.values()) {
++            total += q.size();
++        }
++        return total;
++    }
++
++    /**
++     * Drain up to maxBatches across queues, invoking the sender for each batch.
++     * The sender should perform the actual packet sends and return true if successful.
++     */
++    public int drainOnMain(java.util.function.BiFunction<RecipientQueueKey, RecipientQueue.RecipientBatch, Boolean> sender, int maxBatches) {
++        if (sender == null || maxBatches <= 0) return 0;
++        // Fairness budget (optional)
++        int budget = maxBatches;
++        try {
++            budget = io.multipaper.herculi.fairness.Fairness.tryConsume(io.multipaper.herculi.fairness.Fairness.Category.BROADCAST_DRAIN, maxBatches);
++        } catch (Throwable ignored) {}
++        int sent = 0;
++        for (var entry : queues.entrySet()) {
++            if (sent >= budget) break;
++            RecipientQueueKey key = entry.getKey();
++            RecipientQueue q = entry.getValue();
++            if (q == null || q.isEmpty()) continue;
++            RecipientQueue.RecipientBatch batch;
++            while (sent < budget && q != null && (batch = q.poll()) != null) {
++                try {
++                    if (Boolean.TRUE.equals(sender.apply(key, batch))) {
++                        sent++;
++                    }
++                } catch (Throwable t) {
++                    // ignore send failure for scaffolding
++                }
++            }
++        }
++        return sent;
++    }
++}
+diff --git a/src/main/java/io/multipaper/herculi/chunk/HerculiChunkPipeline.java b/src/main/java/io/multipaper/herculi/chunk/HerculiChunkPipeline.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..c3ff96cab344f74b0df4d17439e4627c7cdd77e3
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/chunk/HerculiChunkPipeline.java
+@@ -0,0 +1,63 @@
++package io.multipaper.herculi.chunk;
++
++/**
++ * Phase 1 scaffolding for the world/chunk async pipeline. This placeholder will
++ * later coordinate async read/write, generation, and lighting stages while
++ * respecting region ownership and thread-affinity. For now, it contains no
++ * behavior and only exists to establish compile-time anchors.
++ */
++public final class HerculiChunkPipeline {
++
++    private static final HerculiChunkPipeline INSTANCE = new HerculiChunkPipeline();
++
++    public static HerculiChunkPipeline instance() {
++        return INSTANCE;
++    }
++
++    private HerculiChunkPipeline() {}
++
++    // Inflight guardrails
++    private static volatile java.util.concurrent.Semaphore inflight;
++    private static java.util.concurrent.Semaphore semaphore() {
++        java.util.concurrent.Semaphore s = inflight;
++        if (s != null) return s;
++        synchronized (HerculiChunkPipeline.class) {
++            if (inflight == null) {
++                int permits = Math.max(1, io.multipaper.herculi.config.HerculiConfig.instance().chunkIoMaxInflight());
++                inflight = new java.util.concurrent.Semaphore(permits);
++            }
++            return inflight;
++        }
++    }
++
++    // --- Minimal scaffold API ---
++    // For now, these are config-gated NO-OPs that demonstrate how region-affine
++    // execution will be used for chunk operations.
++
++    public java.util.concurrent.CompletableFuture<Void> prefetchChunk(final net.minecraft.server.level.ServerLevel level,
++                                                                      final net.minecraft.world.level.ChunkPos pos) {
++        final io.multipaper.herculi.config.HerculiConfig cfg = io.multipaper.herculi.config.HerculiConfig.instance();
++        if (!cfg.threadingEnabled() || !cfg.chunkIoEnabled()) {
++            return java.util.concurrent.CompletableFuture.completedFuture(null);
++        }
++        final java.util.concurrent.Semaphore sem = semaphore();
++        if (!sem.tryAcquire()) {
++            // Respect inflight cap; skip prefetch when saturated
++            return java.util.concurrent.CompletableFuture.completedFuture(null);
++        }
++        final io.multipaper.herculi.region.RegionKey key = io.multipaper.herculi.region.RegionKey.of(level.dimension(),
++            io.multipaper.herculi.region.RegionPos.forChunk(pos));
++        final io.multipaper.herculi.threading.RegionExecutor exec =
++            io.multipaper.herculi.threading.HerculiRegionExecutors.executorFor(key);
++        final java.util.concurrent.CompletableFuture<Void> cf = new java.util.concurrent.CompletableFuture<>();
++        exec.execute(() -> {
++            // Placeholder: real implementation will schedule async IO and stage work
++            try {
++                cf.complete(null);
++            } finally {
++                sem.release();
++            }
++        });
++        return cf;
++    }
++}
+diff --git a/src/main/java/io/multipaper/herculi/chunk/HerculiChunkTicker.java b/src/main/java/io/multipaper/herculi/chunk/HerculiChunkTicker.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..2488fccaa60d97f6002622744d027f6192cda944
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/chunk/HerculiChunkTicker.java
+@@ -0,0 +1,17 @@
++package io.multipaper.herculi.chunk;
++
++/**
++ * Phase 1 scaffolding for a regionized chunk ticker. In later phases, this
++ * will drive per-region chunk ticking and handoffs in coordination with
++ * the region scheduler/locker. Currently a placeholder with no behavior.
++ */
++public final class HerculiChunkTicker {
++
++    private static final HerculiChunkTicker INSTANCE = new HerculiChunkTicker();
++
++    public static HerculiChunkTicker instance() {
++        return INSTANCE;
++    }
++
++    private HerculiChunkTicker() {}
++}
+diff --git a/src/main/java/io/multipaper/herculi/config/HerculiConfig.java b/src/main/java/io/multipaper/herculi/config/HerculiConfig.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..c1a253f2418bbeb8ea7c265863a4c738966f5353
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/config/HerculiConfig.java
+@@ -0,0 +1,287 @@
++package io.multipaper.herculi.config;
++
++/**
++ * Phase 1 scaffolding: Configuration & feature gates placeholder.
++ * In later phases, this will read settings (e.g., herculi.yml) and
++ * expose toggles for multithreading, networking, portal routing, etc.
++ */
++public final class HerculiConfig {
++    private static final HerculiConfig INSTANCE = new HerculiConfig();
++
++    public static HerculiConfig instance() {
++        return INSTANCE;
++    }
++
++    private final java.util.concurrent.ConcurrentHashMap<String, String> values = new java.util.concurrent.ConcurrentHashMap<>();
++    private volatile boolean loaded;
++
++    private HerculiConfig() {}
++
++    // Public API
++    // Multithreaded server: always true
++    public boolean threadingEnabled() { return true; }
++    public boolean handoffEnabled() { return getBoolean("threading.handoff.enabled", false); }
++    public boolean handoffSoundsEnabled() { return getBoolean("threading.handoff.sounds", false); }
++    public boolean handoffParticlesEnabled() { return getBoolean("threading.handoff.particles", false); }
++    public boolean handoffTrackerPacketsEnabled() { return getBoolean("threading.handoff.tracker_packets", false); }
++    public boolean handoffDebugEnabled() { return getBoolean("threading.handoff.debug", false); }
++    // Guardrails & teleport enforcement gates (default ON)
++    public boolean guardrailsEnabled() { return getBoolean("guardrails.enabled", true); }
++    public boolean teleportEnforceMainThread() { return getBoolean("teleport.enforce_main_thread", true); }
++    public boolean networkingParallelFlushEnabled() { return getBoolean("networking.parallel_flush_enabled", false); }
++    public boolean networkFencingEnabled() { return getBoolean("networking.fencing.enabled", false); }
++    public boolean networkFencingDebug() { return getBoolean("networking.fencing.debug", false); }
++    public boolean portalRoutingEnabled() { return getBoolean("portals.routing_enabled", false); }
++    public boolean profilingEnabled() { return getBoolean("profiling.enabled", false); }
++    public boolean marshalPerTarget() { return getBoolean("commands.marshalPerTarget", false); }
++    public boolean marshalDebug() { return getBoolean("commands.marshalDebug", false); }
++    // Level random precompute (default-off)
++    public boolean randomPrecomputeEnabled() { return getBoolean("threading.random_precompute.enabled", false); }
++    // Instrumentation (default-off)
++    public boolean instrumentationUnloadMetricsEnabled() { return getBoolean("instrumentation.unload.metrics_enabled", false); }
++    public boolean instrumentationBlockEntityMetricsEnabled() { return getBoolean("instrumentation.block_entities.metrics_enabled", false); }
++    public int threadingRegionPoolSize() { return Math.max(0, getInt("threading.region_pool_size", 0)); }
++    public int threadingRegionShift() { return Math.max(0, getInt("threading.region_shift", 4)); }
++    public int threadingRegionExecutorIdleMinutes() { return Math.max(1, getInt("threading.region_executor_idle_minutes", 10)); }
++    public int threadingRegionExecutorCleanupEveryEnqueues() { return Math.max(10, getInt("threading.region_executor_cleanup_check_enqueues", 200)); }
++    public boolean chunkIoEnabled() { return getBoolean("threading.chunk_io_enable", false); }
++    public int chunkIoMaxInflight() { return Math.max(1, getInt("threading.chunk_io_max_inflight", 16)); }
++
++    public void reload() {
++        this.loaded = false;
++        this.values.clear();
++        ensureLoaded();
++    }
++
++    // Internal
++    private void ensureLoaded() {
++        if (this.loaded) return;
++        synchronized (this) {
++            if (this.loaded) return;
++            // Load from common locations: ./herculi.yml or ./config/herculi.yml
++            final java.nio.file.Path cwd = java.nio.file.Paths.get("").toAbsolutePath();
++            final java.util.List<java.nio.file.Path> candidates = java.util.List.of(
++                cwd.resolve("herculi.yml"),
++                cwd.resolve("config").resolve("herculi.yml")
++            );
++            boolean found = false;
++            for (java.nio.file.Path path : candidates) {
++                try {
++                    if (java.nio.file.Files.isRegularFile(path)) {
++                        java.util.List<String> lines = java.nio.file.Files.readAllLines(path);
++                        parseKeyValues(lines);
++                        // auto-merge missing defaults into existing file
++                        java.util.Map<String, String> defaults = defaultEntries();
++                        java.util.List<String> toAppend = new java.util.ArrayList<>();
++                        for (java.util.Map.Entry<String, String> e : defaults.entrySet()) {
++                            if (!this.values.containsKey(e.getKey())) {
++                                this.values.put(e.getKey(), e.getValue());
++                                toAppend.add(e.getKey() + ": " + e.getValue());
++                            }
++                        }
++                        if (!toAppend.isEmpty()) {
++                            lines.add("");
++                            lines.add("# Auto-merged missing keys by Herculi");
++                            lines.addAll(toAppend);
++                            try { java.nio.file.Files.write(path, lines); } catch (Throwable ignored) {}
++                        }
++                        found = true;
++                        break; // first found wins
++                    }
++                } catch (Throwable ignored) {
++                    // Ignore parse errors; defaults will apply
++                }
++            }
++            // If not found, write a default scaffold to ./config/herculi.yml
++            if (!found) {
++                try {
++                    final java.nio.file.Path cfgDir = cwd.resolve("config");
++                    final java.nio.file.Path cfgFile = cfgDir.resolve("herculi.yml");
++                    java.nio.file.Files.createDirectories(cfgDir);
++                    if (!java.nio.file.Files.exists(cfgFile)) {
++                        final String scaffold = "# Herculi configuration\n"
++                            + "# Minimal key: value format. Unknown keys are ignored.\n\n"
++                            + "# Threading and regionization\n"
++                            + "threading.enabled: true\n"
++                            + "threading.region_pool_size: 0\n"
++                            + "threading.region_shift: 4\n"
++                            + "threading.region_executor_idle_minutes: 10\n"
++                            + "threading.region_executor_cleanup_check_enqueues: 200\n\n"
++                            + "# Async chunk I/O pipeline\n"
++                            + "threading.chunk_io_enable: false\n"
++                            + "threading.chunk_io_max_inflight: 16\n\n"
++                            + "# Networking options\n"
++                            + "networking.parallel_flush_enabled: false\n"
++                            + "networking.fencing.enabled: false\n"
++                            + "networking.fencing.debug: false\n\n"
++                            + "# Portals/teleportation routing\n"
++                            + "portals.routing_enabled: false\n\n"
++                            + "# Profiling/diagnostics\n"
++                            + "profiling.enabled: false\n\n"
++                            + "# Commands\n"
++                            + "commands.marshalPerTarget: false\n"
++                            + "commands.marshalDebug: false\n\n"
++                            + "# Guardrails (default-on).\n"
++                            + "guardrails.enabled: true\n"
++                            + "teleport.enforce_main_thread: true\n\n"
++                            + "# Handoff (default-off).\n"
++                            + "threading.handoff.enabled: false\n"
++                            + "threading.handoff.sounds: false\n"
++                            + "threading.handoff.particles: false\n"
++                            + "threading.handoff.debug: false\n\n"
++                            + "# Level random tick read-only precompute (default-off)\n"
++                            + "threading.random_precompute.enabled: false\n\n"
++                            + "# Instrumentation toggles (default-off)\n"
++                            + "instrumentation.unload.metrics_enabled: false\n"
++                            + "instrumentation.block_entities.metrics_enabled: false\n"
++                            + "\n# Threaded broadcasting (default-off)\n"
++                            + "broadcasting.threaded.enabled: false\n"
++                            + "broadcasting.threaded.maxBatchesPerQueue: 16\n"
++                            + "broadcasting.threaded.perTickDrainBudget: 4\n"
++                            + "broadcasting.threaded.maxQueuesTotal: 20000\n"
++                            + "broadcasting.threaded.dropPolicy: coalesce\n"
++                            + "broadcasting.threaded.drainIntervalMs: 2\n"
++;
++                            
++                        java.nio.file.Files.writeString(cfgFile, scaffold);
++                    }
++                    // Parse what we just wrote for runtime usage
++                    parseKeyValues(java.nio.file.Files.readAllLines(cfgFile));
++                    // On failure, continue with in-memory defaults
++                } catch (Throwable ignored) {
++                    // failed to write or parse default scaffold; fall back to in-memory defaults
++                }
++            }
++            this.loaded = true;
++        }
++    }
++
++    private void parseKeyValues(java.util.List<String> lines) {
++        for (String raw : lines) {
++            String line = raw.trim();
++            if (line.isEmpty()) continue;
++            if (line.startsWith("#")) continue;
++            int idx = line.indexOf(':');
++            if (idx <= 0) continue;
++            String key = line.substring(0, idx).trim();
++            String val = line.substring(idx + 1).trim();
++            // remove simple quotes if present
++            if ((val.startsWith("\"") && val.endsWith("\"")) || (val.startsWith("'") && val.endsWith("'"))) {
++                val = val.substring(1, val.length() - 1);
++            }
++            if (!key.isEmpty()) {
++                this.values.put(key, val);
++            }
++        }
++    }
++
++    public boolean getBoolean(String key, boolean def) {
++        ensureLoaded();
++        String v = this.values.get(key);
++        if (v == null) return def;
++        v = v.toLowerCase(java.util.Locale.ROOT);
++        if (v.equals("true") || v.equals("yes") || v.equals("on") || v.equals("1")) return true;
++        if (v.equals("false") || v.equals("no") || v.equals("off") || v.equals("0")) return false;
++        return def;
++    }
++
++    public int getInt(String key, int def) {
++        ensureLoaded();
++        String v = this.values.get(key);
++        if (v == null) return def;
++        try {
++            return Integer.parseInt(v.trim());
++        } catch (Throwable ignored) {
++            return def;
++        }
++    }
++
++    public String getString(String key, String def) {
++        ensureLoaded();
++        String v = this.values.get(key);
++        return v == null ? def : v;
++    }
++
++    
++
++    private java.util.Map<String, String> defaultEntries() {
++        java.util.Map<String, String> m = new java.util.LinkedHashMap<>();
++        m.put("threading.enabled", "true");
++        m.put("threading.region_pool_size", "0");
++        m.put("threading.region_shift", "4");
++        m.put("threading.region_executor_idle_minutes", "10");
++        m.put("threading.region_executor_cleanup_check_enqueues", "200");
++        m.put("threading.chunk_io_enable", "false");
++        m.put("threading.chunk_io_max_inflight", "16");
++        m.put("networking.parallel_flush_enabled", "false");
++        m.put("networking.fencing.enabled", "false");
++        m.put("networking.fencing.debug", "false");
++        m.put("portals.routing_enabled", "false");
++        m.put("profiling.enabled", "false");
++        m.put("commands.marshalPerTarget", "false");
++        m.put("commands.marshalDebug", "false");
++        m.put("guardrails.enabled", "true");
++        m.put("teleport.enforce_main_thread", "true");
++        m.put("threading.handoff.enabled", "false");
++        m.put("threading.handoff.sounds", "false");
++        m.put("threading.handoff.particles", "false");
++        m.put("threading.handoff.tracker_packets", "false");
++        m.put("threading.handoff.debug", "false");
++        // Level random tick read-only precompute (default-off)
++        m.put("threading.random_precompute.enabled", "false");
++        // Instrumentation toggles (default-off)
++        m.put("instrumentation.unload.metrics_enabled", "false");
++        m.put("instrumentation.block_entities.metrics_enabled", "false");
++        // Threaded broadcasting (default-off)
++        m.put("broadcasting.threaded.enabled", "false");
++        m.put("broadcasting.threaded.maxBatchesPerQueue", "16");
++        m.put("broadcasting.threaded.perTickDrainBudget", "4");
++        // Tracking caps (default-off)
++        m.put("tracking.max_trackers_per_entity", "0");
++        m.put("tracking.max_trackers_heavy", "0");
++        m.put("tracking.heavy_types", "ITEM,PROJECTILE");
++        // Pathfinding recalculation (default-off)
++        m.put("pathfinding.recalc.enabled", "false");
++        m.put("pathfinding.recalc.minIntervalTicks", "5");
++        m.put("pathfinding.recalc.jitterTicks", "2");
++        m.put("pathfinding.recalc.debug", "false");
++        // Villager sensors throttle (default-off)
++        m.put("villagers.sensors.throttle.enabled", "false");
++        m.put("villagers.sensors.throttle.minIntervalTicks", "10");
++        m.put("villagers.sensors.throttle.jitterTicks", "2");
++        m.put("villagers.sensors.debug", "false");
++        // Fairness budgets (default-off)
++        m.put("fairness.enabled", "false");
++        m.put("fairness.broadcastDrain.budget", "64");
++        m.put("fairness.diagnosticsDrain.budget", "32");
++        m.put("fairness.asyncCompletions.budget", "64");
++        m.put("fairness.debug", "false");
++        return m;
++    }
++
++    // Broadcasting getters
++    public boolean broadcastingThreadedEnabled() { return getBoolean("broadcasting.threaded.enabled", false); }
++    public int broadcastingThreadedMaxQueuesTotal() { return Math.max(1, getInt("broadcasting.threaded.maxQueuesTotal", 20000)); }
++    public int broadcastingThreadedMaxBatchesPerQueue() { return Math.max(1, getInt("broadcasting.threaded.maxBatchesPerQueue", 64)); }
++    public String broadcastingThreadedDropPolicyRaw() { return getString("broadcasting.threaded.dropPolicy", "coalesce"); }
++    public int broadcastingThreadedDrainBudget() { return Math.max(1, getInt("broadcasting.threaded.drainIntervalMs", 2)); }
++
++    // Pathfinding recalculation getters
++    public boolean pathfindingRecalcEnabled() { return getBoolean("pathfinding.recalc.enabled", false); }
++    public int pathfindingRecalcMinIntervalTicks() { return Math.max(0, getInt("pathfinding.recalc.minIntervalTicks", 5)); }
++    public int pathfindingRecalcJitterTicks() { return Math.max(0, getInt("pathfinding.recalc.jitterTicks", 2)); }
++    public boolean pathfindingRecalcDebug() { return getBoolean("pathfinding.recalc.debug", false); }
++
++    // Villager sensors throttle getters
++    public boolean villagerSensorsThrottleEnabled() { return getBoolean("villagers.sensors.throttle.enabled", false); }
++    public int villagerSensorsThrottleMinIntervalTicks() { return Math.max(0, getInt("villagers.sensors.throttle.minIntervalTicks", 10)); }
++    public int villagerSensorsThrottleJitterTicks() { return Math.max(0, getInt("villagers.sensors.throttle.jitterTicks", 2)); }
++    public boolean villagerSensorsDebug() { return getBoolean("villagers.sensors.debug", false); }
++
++    // Fairness getters
++    public boolean fairnessEnabled() { return getBoolean("fairness.enabled", false); }
++    public int fairnessBroadcastDrainBudget() { return Math.max(1, getInt("fairness.broadcastDrain.budget", 64)); }
++    public int fairnessDiagnosticsDrainBudget() { return Math.max(1, getInt("fairness.diagnosticsDrain.budget", 32)); }
++    public int fairnessAsyncCompletionsBudget() { return Math.max(1, getInt("fairness.asyncCompletions.budget", 64)); }
++    public boolean fairnessDebug() { return getBoolean("fairness.debug", false); }
++}
+diff --git a/src/main/java/io/multipaper/herculi/docs/LockInvariants.java b/src/main/java/io/multipaper/herculi/docs/LockInvariants.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..3c4b3bd2dc4f9efa50092558cfd8d68a075e28a6
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/docs/LockInvariants.java
+@@ -0,0 +1,12 @@
++package io.multipaper.herculi.docs;
++
++/**
++ * Phase 1 scaffolding: Locks & Invariants documentation holder.
++ *
++ * This class is intentionally empty and serves as a source anchor where
++ * code-level javadoc and comments can describe region ownership rules,
++ * lock acquisition order, and cross-thread invariants as we implement them.
++ */
++public final class LockInvariants {
++    private LockInvariants() {}
++}
+diff --git a/src/main/java/io/multipaper/herculi/entity/HerculiEntityScheduler.java b/src/main/java/io/multipaper/herculi/entity/HerculiEntityScheduler.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..b6f58651365cd0a61a548a43de7fc7a4627db59a
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/entity/HerculiEntityScheduler.java
+@@ -0,0 +1,17 @@
++package io.multipaper.herculi.entity;
++
++/**
++ * Phase 1 scaffolding for a regionized entity scheduler. Later phases will
++ * implement actor-style ownership and handoffs; this placeholder exists as a
++ * compile-time anchor with no behavior.
++ */
++public final class HerculiEntityScheduler {
++
++    private static final HerculiEntityScheduler INSTANCE = new HerculiEntityScheduler();
++
++    public static HerculiEntityScheduler instance() {
++        return INSTANCE;
++    }
++
++    private HerculiEntityScheduler() {}
++}
+diff --git a/src/main/java/io/multipaper/herculi/fairness/Fairness.java b/src/main/java/io/multipaper/herculi/fairness/Fairness.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..301d1abf4e9e79323936de1c73bbf45e555fa06d
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/fairness/Fairness.java
+@@ -0,0 +1,81 @@
++package io.multipaper.herculi.fairness;
++
++import java.util.concurrent.atomic.AtomicLong;
++
++/**
++ * Fairness budgets and counters (default-off).
++ * Categories are soft budgets per tick; wrappers may be used by callers to cap work.
++ */
++public final class Fairness {
++    private Fairness() {}
++
++    public enum Category { BROADCAST_DRAIN, DIAGNOSTICS_DRAIN, ASYNC_COMPLETIONS }
++
++    // Budgets (units depend on category; for drains, units are "batches" or "items")
++    private static volatile boolean enabled;
++    private static volatile int budgetBroadcastDrain;
++    private static volatile int budgetDiagnosticsDrain;
++    private static volatile int budgetAsyncCompletions;
++
++    // Counters (monotonic)
++    public static final AtomicLong overBudgetBroadcast = new AtomicLong();
++    public static final AtomicLong overBudgetDiagnostics = new AtomicLong();
++    public static final AtomicLong overBudgetAsync = new AtomicLong();
++
++    // Rolling per-tick consumption (reset by caller each tick if used centrally)
++    private static final ThreadLocal<int[]> consumption = ThreadLocal.withInitial(() -> new int[Category.values().length]);
++
++    public static void initFromConfig(io.multipaper.herculi.config.HerculiConfig cfg) {
++        enabled = cfg.fairnessEnabled();
++        budgetBroadcastDrain = Math.max(1, cfg.fairnessBroadcastDrainBudget());
++        budgetDiagnosticsDrain = Math.max(1, cfg.fairnessDiagnosticsDrainBudget());
++        budgetAsyncCompletions = Math.max(1, cfg.fairnessAsyncCompletionsBudget());
++    }
++
++    public static boolean isEnabled() { return enabled; }
++
++    public static int currentBudget(Category c) {
++        return switch (c) {
++            case BROADCAST_DRAIN -> budgetBroadcastDrain;
++            case DIAGNOSTICS_DRAIN -> budgetDiagnosticsDrain;
++            case ASYNC_COMPLETIONS -> budgetAsyncCompletions;
++        };
++    }
++
++    /**
++     * Attempt to consume up to amount units from the category budget. Returns the allowed amount.
++     * If fairness is disabled, returns amount.
++     */
++    public static int tryConsume(Category c, int amount) {
++        if (!enabled || amount <= 0) return amount;
++        int idx = c.ordinal();
++        int[] cons = consumption.get();
++        int used = cons[idx];
++        int budget = currentBudget(c);
++        int remaining = Math.max(0, budget - used);
++        if (remaining <= 0) {
++            incrementOver(c);
++            return 0;
++        }
++        int allowed = Math.min(amount, remaining);
++        cons[idx] = used + allowed;
++        if (allowed < amount) incrementOver(c);
++        return allowed;
++    }
++
++    private static void incrementOver(Category c) {
++        switch (c) {
++            case BROADCAST_DRAIN -> overBudgetBroadcast.incrementAndGet();
++            case DIAGNOSTICS_DRAIN -> overBudgetDiagnostics.incrementAndGet();
++            case ASYNC_COMPLETIONS -> overBudgetAsync.incrementAndGet();
++        }
++    }
++
++    /**
++     * Reset per-tick consumption counters for the current thread. Typically called once per main-tick.
++     */
++    public static void resetTickConsumption() {
++        int[] cons = consumption.get();
++        java.util.Arrays.fill(cons, 0);
++    }
++}
+diff --git a/src/main/java/io/multipaper/herculi/instrumentation/HerculiBlockEntityMetrics.java b/src/main/java/io/multipaper/herculi/instrumentation/HerculiBlockEntityMetrics.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..392230a07243896ab72b8e8ba201931e1d11f40e
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/instrumentation/HerculiBlockEntityMetrics.java
+@@ -0,0 +1,40 @@
++package io.multipaper.herculi.instrumentation;
++
++import java.util.concurrent.atomic.AtomicLong;
++
++public final class HerculiBlockEntityMetrics {
++    private static final AtomicLong count = new AtomicLong();
++    private static final AtomicLong nanosTotal = new AtomicLong();
++    private static final AtomicLong nanosMax = new AtomicLong();
++
++    private HerculiBlockEntityMetrics() {}
++
++    public static long start() {
++        return System.nanoTime();
++    }
++
++    public static void end(long startNanoTime) {
++        if (startNanoTime == 0L) return;
++        long dur = System.nanoTime() - startNanoTime;
++        count.incrementAndGet();
++        nanosTotal.addAndGet(dur);
++        long prev;
++        while (dur > (prev = nanosMax.get())) {
++            if (nanosMax.compareAndSet(prev, dur)) break;
++        }
++    }
++
++    public static long getCount() { return count.get(); }
++    public static long getAvgMicros() {
++        long c = count.get();
++        if (c == 0L) return 0L;
++        return (nanosTotal.get() / c) / 1_000L;
++    }
++    public static long getMaxMicros() { return nanosMax.get() / 1_000L; }
++
++    public static void reset() {
++        count.set(0L);
++        nanosTotal.set(0L);
++        nanosMax.set(0L);
++    }
++}
+diff --git a/src/main/java/io/multipaper/herculi/instrumentation/HerculiInstrumentation.java b/src/main/java/io/multipaper/herculi/instrumentation/HerculiInstrumentation.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..9d8551f0263ff5628e7508c8316b684f766cdd64
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/instrumentation/HerculiInstrumentation.java
+@@ -0,0 +1,29 @@
++package io.multipaper.herculi.instrumentation;
++
++/**
++ * Phase 1 scaffolding: Instrumentation & metrics placeholder.
++ * Intended to expose counters/timers/hooks wired in later phases.
++ */
++public final class HerculiInstrumentation {
++    private static final HerculiInstrumentation INSTANCE = new HerculiInstrumentation();
++
++    public static HerculiInstrumentation instance() {
++        return INSTANCE;
++    }
++
++    private final java.util.concurrent.atomic.AtomicLong regionPoolsCreated = new java.util.concurrent.atomic.AtomicLong();
++    private final java.util.concurrent.atomic.AtomicLong regionTasksEnqueued = new java.util.concurrent.atomic.AtomicLong();
++    private final java.util.concurrent.atomic.AtomicLong regionTasksExecuted = new java.util.concurrent.atomic.AtomicLong();
++
++    private HerculiInstrumentation() {}
++
++    // Increments
++    public void incRegionPoolCreated() { regionPoolsCreated.incrementAndGet(); }
++    public void incRegionTasksEnqueued() { regionTasksEnqueued.incrementAndGet(); }
++    public void incRegionTasksExecuted() { regionTasksExecuted.incrementAndGet(); }
++
++    // Snapshots
++    public long regionPoolsCreated() { return regionPoolsCreated.get(); }
++    public long regionTasksEnqueued() { return regionTasksEnqueued.get(); }
++    public long regionTasksExecuted() { return regionTasksExecuted.get(); }
++}
+diff --git a/src/main/java/io/multipaper/herculi/instrumentation/HerculiProfiler.java b/src/main/java/io/multipaper/herculi/instrumentation/HerculiProfiler.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..52fd049c48a7aa992fc1ffcd2fd900ec92d251b8
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/instrumentation/HerculiProfiler.java
+@@ -0,0 +1,71 @@
++package io.multipaper.herculi.instrumentation;
++
++/**
++ * Simple profiling scaffold. Optionally integrates with JFR when available.
++ */
++public final class HerculiProfiler {
++    private static final HerculiProfiler INSTANCE = new HerculiProfiler();
++    public static HerculiProfiler instance() { return INSTANCE; }
++
++    private volatile boolean running;
++    private volatile long startMillis;
++    private volatile long lastDurationMillis;
++
++    // JFR support (optional)
++    private Object jfrRecording; // avoid hard dependency at compile sites
++
++    private HerculiProfiler() {}
++
++    public synchronized String start(boolean withJfr) {
++        if (this.running) {
++            return "Profiling already running (" + elapsedMillis() + " ms).";
++        }
++        this.running = true;
++        this.startMillis = System.currentTimeMillis();
++        this.lastDurationMillis = 0L;
++
++        if (withJfr) {
++            try {
++                // reflective use of jdk.jfr.Recording to avoid compile/link issues in custom toolchains
++                Class<?> recCls = Class.forName("jdk.jfr.Recording");
++                Object rec = recCls.getConstructor().newInstance();
++                recCls.getMethod("start").invoke(rec);
++                this.jfrRecording = rec;
++            } catch (Throwable ignored) {
++                // JFR not available or failed; continue without it
++                this.jfrRecording = null;
++                return "Profiling started (JFR unavailable).";
++            }
++            return "Profiling started with JFR.";
++        }
++        return "Profiling started.";
++    }
++
++    public synchronized String stop() {
++        if (!this.running) {
++            return "Profiling not running.";
++        }
++        this.running = false;
++        this.lastDurationMillis = System.currentTimeMillis() - this.startMillis;
++
++        if (this.jfrRecording != null) {
++            try {
++                // dump to default filename in server working dir
++                Class<?> recCls = this.jfrRecording.getClass();
++                // jdk.jfr.Recording#dump(Path) — we try to dump to a timestamped file
++                java.nio.file.Path out = java.nio.file.Paths.get("herculi-profile-" + this.startMillis + ".jfr");
++                recCls.getMethod("dump", java.nio.file.Path.class).invoke(this.jfrRecording, out);
++                recCls.getMethod("close").invoke(this.jfrRecording);
++                this.jfrRecording = null;
++                return "Profiling stopped. Duration=" + this.lastDurationMillis + " ms. JFR saved to " + out.toString();
++            } catch (Throwable ignored) {
++                this.jfrRecording = null;
++                return "Profiling stopped. Duration=" + this.lastDurationMillis + " ms. (JFR dump failed)";
++            }
++        }
++        return "Profiling stopped. Duration=" + this.lastDurationMillis + " ms.";
++    }
++
++    public boolean isRunning() { return this.running; }
++    public long elapsedMillis() { return this.running ? (System.currentTimeMillis() - this.startMillis) : this.lastDurationMillis; }
++}
+diff --git a/src/main/java/io/multipaper/herculi/instrumentation/HerculiQueues.java b/src/main/java/io/multipaper/herculi/instrumentation/HerculiQueues.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..3f1046974cde336dd3a2939b18c1b687771ddc58
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/instrumentation/HerculiQueues.java
+@@ -0,0 +1,54 @@
++package io.multipaper.herculi.instrumentation;
++
++import io.multipaper.herculi.threading.RegionSchedulers;
++import io.multipaper.herculi.broadcast.BroadcastMetrics;
++import io.multipaper.herculi.broadcast.BroadcastRegistry;
++
++/**
++ * Queues/back-pressure snapshot scaffolding.
++ * Phase 0: returns basic counters from instrumentation; integrate real queues later.
++ */
++public final class HerculiQueues {
++    private static final HerculiQueues INSTANCE = new HerculiQueues();
++    public static HerculiQueues instance() { return INSTANCE; }
++    private HerculiQueues() {}
++
++    public String snapshot() {
++        HerculiInstrumentation inst = HerculiInstrumentation.instance();
++        long pools = inst.regionPoolsCreated();
++        long enq = inst.regionTasksEnqueued();
++        long exe = inst.regionTasksExecuted();
++        long inFlight = Math.max(0, enq - exe);
++        int active = RegionSchedulers.activeExecutorCount();
++        // Level probes
++        String levelProbe = "";
++        try {
++            long lpSched = LevelParallelProbe.getScheduled();
++            long lpDone = LevelParallelProbe.getCompleted();
++            levelProbe = ", levelProbe.scheduled=" + lpSched + ", levelProbe.completed=" + lpDone
++                + ", precompute.scheduled=" + io.multipaper.herculi.threading.LevelRandomPrecompute.getScheduled()
++                + ", precompute.completed=" + io.multipaper.herculi.threading.LevelRandomPrecompute.getCompleted();
++        } catch (Throwable ignored) {}
++        // Broadcast metrics (if available)
++        String broadcast = "";
++        try {
++            final boolean bcEnabled = BroadcastRegistry.enabled();
++            final int qMgrSize = BroadcastRegistry.manager().size();
++            final int qPending = BroadcastRegistry.manager().pendingSize();
++            final long qActive = BroadcastMetrics.getActiveQueues();
++            final long enqB = BroadcastMetrics.getEnqueuedBatches();
++            final long deqB = BroadcastMetrics.getDequeuedBatches();
++            final long dropOv = BroadcastMetrics.getDroppedBatchesOverflow();
++            final long dropTo = BroadcastMetrics.getDroppedBatchesTimeout();
++            broadcast = ", broadcast.enabled=" + bcEnabled
++                + ", broadcast.managerSize=" + qMgrSize
++                + ", broadcast.pendingBatches=" + qPending
++                + ", broadcast.activeQueues=" + qActive
++                + ", broadcast.enqueuedBatches=" + enqB
++                + ", broadcast.dequeuedBatches=" + deqB
++                + ", broadcast.dropOverflow=" + dropOv
++                + ", broadcast.dropTimeout=" + dropTo;
++        } catch (Throwable ignored) {}
++        return "activeExecutors=" + active + ", poolsCreated=" + pools + ", enqueued=" + enq + ", executed=" + exe + ", inFlight=" + inFlight + levelProbe + broadcast;
++    }
++}
+diff --git a/src/main/java/io/multipaper/herculi/instrumentation/HerculiUnloadMetrics.java b/src/main/java/io/multipaper/herculi/instrumentation/HerculiUnloadMetrics.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..578ab934f51e4b3b3fe59bb10ffc43459e99fb2d
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/instrumentation/HerculiUnloadMetrics.java
+@@ -0,0 +1,45 @@
++package io.multipaper.herculi.instrumentation;
++
++import java.util.concurrent.atomic.AtomicLong;
++
++public final class HerculiUnloadMetrics {
++    private static final AtomicLong count = new AtomicLong();
++    private static final AtomicLong nanosTotal = new AtomicLong();
++    private static final AtomicLong nanosMax = new AtomicLong();
++
++    private HerculiUnloadMetrics() {}
++
++    public static long start() {
++        return System.nanoTime();
++    }
++
++    public static void end(long startNanoTime) {
++        if (startNanoTime == 0L) return;
++        long dur = System.nanoTime() - startNanoTime;
++        count.incrementAndGet();
++        nanosTotal.addAndGet(dur);
++        // max update loop
++        long prev;
++        while (dur > (prev = nanosMax.get())) {
++            if (nanosMax.compareAndSet(prev, dur)) break;
++        }
++    }
++
++    public static long getCount() { return count.get(); }
++    public static long getTotalNanos() { return nanosTotal.get(); }
++    public static long getMaxNanos() { return nanosMax.get(); }
++
++    public static long getAvgMicros() {
++        long c = count.get();
++        if (c == 0L) return 0L;
++        return (nanosTotal.get() / c) / 1_000L;
++    }
++
++    public static long getMaxMicros() { return nanosMax.get() / 1_000L; }
++
++    public static void reset() {
++        count.set(0L);
++        nanosTotal.set(0L);
++        nanosMax.set(0L);
++    }
++}
+diff --git a/src/main/java/io/multipaper/herculi/instrumentation/LevelParallelProbe.java b/src/main/java/io/multipaper/herculi/instrumentation/LevelParallelProbe.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..3f894b0ebaa5c2d6cfee9311cf6b5a7c7acc7a15
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/instrumentation/LevelParallelProbe.java
+@@ -0,0 +1,34 @@
++package io.multipaper.herculi.instrumentation;
++
++import io.multipaper.herculi.config.HerculiConfig;
++import io.multipaper.herculi.threading.WorldRegionScheduler;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.level.chunk.LevelChunk;
++
++import java.util.concurrent.atomic.AtomicLong;
++
++/**
++ * Experimental parallel tick scaffolding. Default-off and side-effect free.
++ * Used to validate region scheduling without touching game logic.
++ */
++public final class LevelParallelProbe {
++    private static final AtomicLong scheduled = new AtomicLong();
++    private static final AtomicLong completed = new AtomicLong();
++
++    private LevelParallelProbe() {}
++
++    public static void probe(ServerLevel level, LevelChunk chunk) {
++        if (level == null || chunk == null) return;
++        if (!HerculiConfig.instance().threadingEnabled()) return;
++        final int bx = chunk.getPos().getMinBlockX();
++        final int bz = chunk.getPos().getMinBlockZ();
++        scheduled.incrementAndGet();
++        WorldRegionScheduler.execute(level, bx, bz, () -> {
++            // no-op: intentionally do nothing; this is a scheduling probe only
++            completed.incrementAndGet();
++        });
++    }
++
++    public static long getScheduled() { return scheduled.get(); }
++    public static long getCompleted() { return completed.get(); }
++}
+diff --git a/src/main/java/io/multipaper/herculi/net/NetworkFence.java b/src/main/java/io/multipaper/herculi/net/NetworkFence.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..35f6af415f3b767dc905c4ec766b9455b8b7dcd9
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/net/NetworkFence.java
+@@ -0,0 +1,33 @@
++package io.multipaper.herculi.net;
++
++import io.multipaper.herculi.config.HerculiConfig;
++import org.jetbrains.annotations.NotNull;
++
++/**
++ * Network pipeline fencing scaffolding.
++ * Default-off. When enabled, allows code paths to fence/buffer network writes so
++ * that cross-thread emissions preserve ordering and avoid races.
++ *
++ * Phase 0: no-ops with optional debug logging.
++ */
++public final class NetworkFence {
++    private NetworkFence() {}
++
++    public static boolean enabled() {
++        return HerculiConfig.instance().networkFencingEnabled();
++    }
++
++    public static void beforeWrite(@NotNull String context) {
++        if (!enabled()) return;
++        if (HerculiConfig.instance().networkFencingDebug()) {
++            org.bukkit.Bukkit.getLogger().info("[Herculi][NetFence] beforeWrite " + context);
++        }
++    }
++
++    public static void afterWrite(@NotNull String context) {
++        if (!enabled()) return;
++        if (HerculiConfig.instance().networkFencingDebug()) {
++            org.bukkit.Bukkit.getLogger().info("[Herculi][NetFence] afterWrite  " + context);
++        }
++    }
++}
+diff --git a/src/main/java/io/multipaper/herculi/networking/HerculiNetworkPipeline.java b/src/main/java/io/multipaper/herculi/networking/HerculiNetworkPipeline.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..3e6e18e7296666c79c1842deed22d25e1fb72a66
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/networking/HerculiNetworkPipeline.java
+@@ -0,0 +1,17 @@
++package io.multipaper.herculi.networking;
++
++/**
++ * Phase 1 scaffolding for networking thread-safe handoffs. This class will
++ * later coordinate encode/decode staging, session fencing, and flush strategies.
++ * Currently a placeholder with no behavior.
++ */
++public final class HerculiNetworkPipeline {
++
++    private static final HerculiNetworkPipeline INSTANCE = new HerculiNetworkPipeline();
++
++    public static HerculiNetworkPipeline instance() {
++        return INSTANCE;
++    }
++
++    private HerculiNetworkPipeline() {}
++}
+diff --git a/src/main/java/io/multipaper/herculi/region/RegionKey.java b/src/main/java/io/multipaper/herculi/region/RegionKey.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..c258861e45e39248ba7b51a6ce7fb85d7d0e6833
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/region/RegionKey.java
+@@ -0,0 +1,52 @@
++package io.multipaper.herculi.region;
++
++import java.util.Objects;
++import net.minecraft.core.BlockPos;
++import net.minecraft.resources.ResourceKey;
++import net.minecraft.world.level.Level;
++
++/**
++ * Identifies a region within a specific dimension.
++ *
++ * This is scaffolding for Phase 1 and is intentionally kept minimal.
++ */
++public final class RegionKey {
++    public final ResourceKey<Level> dimension;
++    public final int rx;
++    public final int rz;
++
++    public RegionKey(final ResourceKey<Level> dimension, final int rx, final int rz) {
++        this.dimension = Objects.requireNonNull(dimension, "dimension");
++        this.rx = rx;
++        this.rz = rz;
++    }
++
++    public static RegionKey of(final ResourceKey<Level> dimension, final RegionPos pos) {
++        return new RegionKey(dimension, pos.rx, pos.rz);
++    }
++
++    public static RegionKey ofBlock(final Level level, final BlockPos pos) {
++        return of(level.dimension(), RegionPos.forBlock(pos));
++    }
++
++    @Override
++    public boolean equals(Object o) {
++        if (this == o) return true;
++        if (!(o instanceof RegionKey)) return false;
++        RegionKey regionKey = (RegionKey) o;
++        return rx == regionKey.rx && rz == regionKey.rz && dimension.equals(regionKey.dimension);
++    }
++
++    @Override
++    public int hashCode() {
++        int result = dimension.hashCode();
++        result = 31 * result + rx;
++        result = 31 * result + rz;
++        return result;
++    }
++
++    @Override
++    public String toString() {
++        return "RegionKey{" + dimension.location() + ":" + rx + "," + rz + '}';
++    }
++}
+diff --git a/src/main/java/io/multipaper/herculi/region/RegionPos.java b/src/main/java/io/multipaper/herculi/region/RegionPos.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..f1e6f624109e663f4e6eaa259fa838d96a800bd8
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/region/RegionPos.java
+@@ -0,0 +1,57 @@
++package io.multipaper.herculi.region;
++
++import net.minecraft.core.BlockPos;
++import net.minecraft.world.level.ChunkPos;
++import io.multipaper.herculi.config.HerculiConfig;
++
++/**
++ * Region position utility. Regions are power-of-two sized groups of chunks.
++ * This is a placeholder for Phase 1 scaffolding and may change during porting.
++ */
++public final class RegionPos {
++    public static final int DEFAULT_REGION_SHIFT = 4; // fallback
++
++    public final int rx;
++    public final int rz;
++
++    public RegionPos(int rx, int rz) {
++        this.rx = rx;
++        this.rz = rz;
++    }
++
++    public static RegionPos forChunk(int cx, int cz) {
++        int shift = Math.max(0, HerculiConfig.instance().threadingRegionShift());
++        return new RegionPos(cx >> shift, cz >> shift);
++    }
++
++    public static RegionPos forChunk(ChunkPos chunkPos) {
++        return forChunk(chunkPos.x, chunkPos.z);
++    }
++
++    public static RegionPos forBlock(BlockPos pos) {
++        // Convert to chunk coords first, then to region
++        int cx = pos.getX() >> 4;
++        int cz = pos.getZ() >> 4;
++        return forChunk(cx, cz);
++    }
++
++    @Override
++    public boolean equals(Object o) {
++        if (this == o) return true;
++        if (!(o instanceof RegionPos)) return false;
++        RegionPos that = (RegionPos) o;
++        return rx == that.rx && rz == that.rz;
++    }
++
++    @Override
++    public int hashCode() {
++        int result = rx;
++        result = 31 * result + rz;
++        return result;
++    }
++
++    @Override
++    public String toString() {
++        return "RegionPos{" + "rx=" + rx + ", rz=" + rz + '}';
++    }
++}
+diff --git a/src/main/java/io/multipaper/herculi/spawn/CustomSpawner.java b/src/main/java/io/multipaper/herculi/spawn/CustomSpawner.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..783d04fefc9f4c53bc88869120ef20339425614f
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/spawn/CustomSpawner.java
+@@ -0,0 +1,24 @@
++package io.multipaper.herculi.spawn;
++
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.entity.MobCategory;
++import net.minecraft.world.level.NaturalSpawner;
++import net.minecraft.world.level.chunk.LevelChunk;
++
++/**
++ * Extension point for custom natural spawners.
++ * Implementations must be fast and MUST NOT load chunks synchronously.
++ * Only called when registry is non-empty and config allows (default-off).
++ */
++public interface CustomSpawner {
++    /**
++     * Whether this spawner is enabled. Called on main thread.
++     */
++    default boolean enabled() { return true; }
++
++    /**
++     * Perform custom spawn logic for a given category and chunk. Implementations
++     * should respect mobcaps (via spawnState.canSpawnForCategoryLocal/Global) and avoid chunk loads.
++     */
++    void spawnForChunk(ServerLevel level, LevelChunk chunk, MobCategory category, NaturalSpawner.SpawnState spawnState);
++}
+diff --git a/src/main/java/io/multipaper/herculi/spawn/CustomSpawnerRegistry.java b/src/main/java/io/multipaper/herculi/spawn/CustomSpawnerRegistry.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..929579b3ca65fee8713959bc0db62ca69587c457
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/spawn/CustomSpawnerRegistry.java
+@@ -0,0 +1,46 @@
++package io.multipaper.herculi.spawn;
++
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.entity.MobCategory;
++import net.minecraft.world.level.NaturalSpawner;
++import net.minecraft.world.level.chunk.LevelChunk;
++
++import java.util.Objects;
++import java.util.concurrent.CopyOnWriteArrayList;
++
++/**
++ * Thread-safe registry for CustomSpawner implementations.
++ * Default-off: if the registry is empty, no hooks run and vanilla behavior is unchanged.
++ */
++public final class CustomSpawnerRegistry {
++    private static final CustomSpawnerRegistry INSTANCE = new CustomSpawnerRegistry();
++    public static CustomSpawnerRegistry instance() { return INSTANCE; }
++
++    private final CopyOnWriteArrayList<CustomSpawner> spawners = new CopyOnWriteArrayList<>();
++
++    private CustomSpawnerRegistry() {}
++
++    public void register(CustomSpawner spawner) {
++        Objects.requireNonNull(spawner, "spawner");
++        spawners.addIfAbsent(spawner);
++    }
++
++    public void unregister(CustomSpawner spawner) {
++        if (spawner != null) spawners.remove(spawner);
++    }
++
++    public boolean hasSpawners() { return !spawners.isEmpty(); }
++
++    public void spawnForChunk(ServerLevel level, LevelChunk chunk, MobCategory category, NaturalSpawner.SpawnState spawnState) {
++        if (spawners.isEmpty()) return; // default-off
++        for (CustomSpawner s : spawners) {
++            try {
++                if (s.enabled()) {
++                    s.spawnForChunk(level, chunk, category, spawnState);
++                }
++            } catch (Throwable ignored) {
++                // swallow to ensure custom spawner can't break vanilla pipeline
++            }
++        }
++    }
++}
+diff --git a/src/main/java/io/multipaper/herculi/threading/CommandMarshal.java b/src/main/java/io/multipaper/herculi/threading/CommandMarshal.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..20317d62397fd9ef8c461c57ff81f62bcd9acc79
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/threading/CommandMarshal.java
+@@ -0,0 +1,49 @@
++package io.multipaper.herculi.threading;
++
++import io.multipaper.herculi.config.HerculiConfig;
++import org.bukkit.Bukkit;
++import org.bukkit.entity.Player;
++
++/**
++ * Command marshalling helper. In Phase 1 this is a thin facade that
++ * ensures execution on a safe thread when commands target a specific player.
++ *
++ * Future phases will route to that player's region executor.
++ */
++public final class CommandMarshal {
++    private CommandMarshal() {}
++
++    /**
++     * Run the given task for a target player, honoring the config flag
++     * commands.marshalPerTarget. For now, this schedules on the main thread
++     * if not already there.
++     */
++    public static void forPlayer(Player target, Runnable task) {
++        if (task == null) return;
++        if (!HerculiConfig.instance().marshalPerTarget()) {
++            task.run();
++            return;
++        }
++        // Maintain synchronous semantics on main thread for command handlers
++        if (Bukkit.isPrimaryThread()) {
++            if (HerculiConfig.instance().marshalDebug()) {
++                Bukkit.getLogger().info("[Herculi] CommandMarshal: main-thread inline for target=" + (target != null ? target.getName() : "<null>"));
++            }
++            task.run();
++            return;
++        }
++        // Off-main: route to region executor then bounce to Bukkit main for safety
++        try {
++            if (HerculiConfig.instance().marshalDebug()) {
++                Bukkit.getLogger().info("[Herculi] CommandMarshal: routing via region executor for target=" + (target != null ? target.getName() : "<null>"));
++            } else {
++                Bukkit.getLogger().fine(() -> "[Herculi] CommandMarshal: routing via region executor for target=" + (target != null ? target.getName() : "<null>"));
++            }
++            RegionSchedulers.executeForThenMain(target, task);
++        } catch (Throwable t) {
++            // Fallback: ensure main-thread execution
++            Bukkit.getLogger().warning("[Herculi] CommandMarshal: region route failed, falling back to main: " + t);
++            Bukkit.getScheduler().runTask(Bukkit.getPluginManager().getPlugins()[0], task);
++        }
++    }
++}
+diff --git a/src/main/java/io/multipaper/herculi/threading/EntityRegionScheduler.java b/src/main/java/io/multipaper/herculi/threading/EntityRegionScheduler.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..677de846321342c7fa3fb8afd92a32593eec7850
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/threading/EntityRegionScheduler.java
+@@ -0,0 +1,42 @@
++package io.multipaper.herculi.threading;
++
++import io.multipaper.herculi.config.HerculiConfig;
++import io.multipaper.herculi.region.RegionKey;
++import io.multipaper.herculi.region.RegionPos;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.entity.Entity;
++import net.minecraft.world.level.ChunkPos;
++
++import java.util.Objects;
++import java.util.concurrent.CompletableFuture;
++
++/**
++ * Minimal scaffold for entity-affine scheduling. Default-off and no-op when disabled.
++ */
++public final class EntityRegionScheduler {
++
++    private EntityRegionScheduler() {}
++
++    public static void execute(final Entity entity, final Runnable task) {
++        Objects.requireNonNull(task, "task");
++        if (entity == null) { task.run(); return; }
++        if (!HerculiConfig.instance().threadingEnabled()) { task.run(); return; }
++        final ServerLevel level = (ServerLevel) entity.level();
++        final ChunkPos pos = new ChunkPos(entity.chunkPosition().x, entity.chunkPosition().z);
++        final RegionKey key = RegionKey.of(level.dimension(), RegionPos.forChunk(pos));
++        final RegionExecutor exec = HerculiRegionExecutors.executorFor(key);
++        exec.execute(task);
++    }
++
++    public static <T> CompletableFuture<T> supply(final Entity entity, final java.util.function.Supplier<T> supplier) {
++        Objects.requireNonNull(supplier, "supplier");
++        if (entity == null || !HerculiConfig.instance().threadingEnabled()) {
++            return CompletableFuture.completedFuture(supplier.get());
++        }
++        final CompletableFuture<T> cf = new CompletableFuture<>();
++        execute(entity, () -> {
++            try { cf.complete(supplier.get()); } catch (Throwable t) { cf.completeExceptionally(t); }
++        });
++        return cf;
++    }
++}
+diff --git a/src/main/java/io/multipaper/herculi/threading/HerculiRegionExecutors.java b/src/main/java/io/multipaper/herculi/threading/HerculiRegionExecutors.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..46b1e8e73cb17e8aa85ac0e3dec66a5f70cd0f13
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/threading/HerculiRegionExecutors.java
+@@ -0,0 +1,119 @@
++package io.multipaper.herculi.threading;
++
++import io.multipaper.herculi.region.RegionKey;
++import io.multipaper.herculi.config.HerculiConfig;
++import io.multipaper.herculi.instrumentation.HerculiInstrumentation;
++import java.util.Map;
++import java.util.Objects;
++import java.util.Queue;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ConcurrentLinkedQueue;
++import java.util.concurrent.Executor;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.ThreadFactory;
++
++/**
++ * Phase 1 scaffold: returns a region-affine executor.
++ * When threading is disabled (default), returns a direct executor (inline run)
++ * to avoid behavior changes. When enabled via config, provides a per-region
++ * serial executor backed by a shared worker pool.
++ */
++public final class HerculiRegionExecutors {
++
++    private static final RegionExecutor DIRECT = RegionExecutor.DIRECT;
++    private static final Map<RegionKey, RegionExecutor> EXECUTORS = new ConcurrentHashMap<>();
++    private static volatile ExecutorService POOL;
++
++    private HerculiRegionExecutors() {}
++
++    public static RegionExecutor executorFor(final RegionKey key) {
++        Objects.requireNonNull(key, "key");
++        if (!HerculiConfig.instance().threadingEnabled()) {
++            return DIRECT;
++        }
++        ensurePool();
++        return EXECUTORS.computeIfAbsent(key, k -> new SerialRegionExecutor(POOL));
++    }
++
++    private static void ensurePool() {
++        if (POOL != null && !POOL.isShutdown()) return;
++        synchronized (HerculiRegionExecutors.class) {
++            if (POOL != null && !POOL.isShutdown()) return;
++            int configured = HerculiConfig.instance().threadingRegionPoolSize();
++            final int threads = Math.max(2, configured > 0 ? configured : Runtime.getRuntime().availableProcessors());
++            final ThreadFactory tf = r -> {
++                Thread t = new Thread(r, "Herculi-RegionPool");
++                t.setDaemon(true);
++                return t;
++            };
++            POOL = Executors.newFixedThreadPool(threads, tf);
++            HerculiInstrumentation.instance().incRegionPoolCreated();
++            // Best-effort shutdown on JVM exit; server should later hook into lifecycle to call shutdown() explicitly.
++            try {
++                Runtime.getRuntime().addShutdownHook(new Thread(HerculiRegionExecutors::shutdown, "Herculi-RegionPool-Shutdown"));
++            } catch (Throwable ignored) {}
++        }
++    }
++
++    /**
++     * Serial executor that preserves FIFO order per region while executing tasks on a shared pool.
++     */
++    private static final class SerialRegionExecutor implements RegionExecutor, Executor {
++        private final Executor pool;
++        private final Queue<Runnable> queue = new ConcurrentLinkedQueue<>();
++        private volatile boolean running;
++
++        SerialRegionExecutor(final Executor pool) {
++            this.pool = pool;
++        }
++
++        @Override
++        public void execute(final Runnable task) {
++            if (task == null) return;
++            queue.add(task);
++            HerculiInstrumentation.instance().incRegionTasksEnqueued();
++            schedule();
++        }
++
++        private void schedule() {
++            if (running) return;
++            synchronized (this) {
++                if (running) return;
++                running = true;
++            }
++            pool.execute(this::drain);
++        }
++
++        private void drain() {
++            try {
++                for (;;) {
++                    Runnable r = queue.poll();
++                    if (r == null) break;
++                    try { r.run(); } catch (Throwable ignored) {} finally {
++                        HerculiInstrumentation.instance().incRegionTasksExecuted();
++                    }
++                }
++            } finally {
++                synchronized (this) {
++                    running = false;
++                    if (!queue.isEmpty()) {
++                        running = true;
++                        pool.execute(this::drain);
++                    }
++                }
++            }
++        }
++    }
++
++    /**
++     * Gracefully shutdown the region executor pool and clear per-region executors.
++     */
++    public static void shutdown() {
++        final ExecutorService p = POOL;
++        if (p != null) {
++            p.shutdownNow();
++        }
++        EXECUTORS.clear();
++    }
++}
+diff --git a/src/main/java/io/multipaper/herculi/threading/HerculiRegionLocker.java b/src/main/java/io/multipaper/herculi/threading/HerculiRegionLocker.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..a5aebd2168112c0a5bef9611b2fa486ccafeaf9c
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/threading/HerculiRegionLocker.java
+@@ -0,0 +1,225 @@
++package io.multipaper.herculi.threading;
++
++import io.multipaper.herculi.region.RegionKey;
++import io.multipaper.herculi.config.HerculiConfig;
++import java.util.concurrent.locks.StampedLock;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.Map;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.Comparator;
++import java.util.List;
++import java.util.concurrent.atomic.AtomicLong;
++
++/**
++ * Minimal scaffolding for a region locker. This will evolve to handle
++ * per-region read/write locks and neighbor locking semantics. For now,
++ * it exposes a placeholder global lock and no-op acquisition APIs to
++ * allow early integrations to compile without changing behavior.
++ */
++public final class HerculiRegionLocker {
++    private static final HerculiRegionLocker INSTANCE = new HerculiRegionLocker();
++
++    public static HerculiRegionLocker instance() {
++        return INSTANCE;
++    }
++
++    /**
++     * Acquire a neighborhood of read locks around a center region with a square radius.
++     * Locks are acquired in a deterministic order to avoid deadlocks.
++     */
++    public RegionLock acquireReadNeighborhood(final RegionKey center, final int radius) {
++        if (!HerculiConfig.instance().threadingEnabled() || center == null || radius <= 0) {
++            return RegionLock.noop();
++        }
++        final List<RegionKey> keys = new ArrayList<>();
++        for (int dz = -radius; dz <= radius; dz++) {
++            for (int dx = -radius; dx <= radius; dx++) {
++                keys.add(new RegionKey(center.dimension, center.rx + dx, center.rz + dz));
++            }
++        }
++        keys.sort(Comparator
++            .comparingInt((RegionKey k) -> k.rx)
++            .thenComparingInt(k -> k.rz));
++
++        final List<StampedLock> locks = new ArrayList<>(keys.size());
++        final List<Long> stamps = new ArrayList<>(keys.size());
++        boolean success = false;
++        try {
++            for (RegionKey k : keys) {
++                final StampedLock l = regionLocks.computeIfAbsent(k, kk -> new StampedLock());
++                final long s = l.readLock();
++                locks.add(l);
++                stamps.add(s);
++                readAcquired.incrementAndGet();
++            }
++            success = true;
++        } finally {
++            if (!success) {
++                for (int i = stamps.size() - 1; i >= 0; i--) {
++                    try { locks.get(i).unlockRead(stamps.get(i)); } catch (Throwable ignored) {} finally { readReleased.incrementAndGet(); }
++                }
++            }
++        }
++
++        return RegionLock.of(() -> {
++            for (int i = stamps.size() - 1; i >= 0; i--) {
++                try { locks.get(i).unlockRead(stamps.get(i)); } catch (Throwable ignored) {} finally { readReleased.incrementAndGet(); }
++            }
++        });
++    }
++
++    /**
++     * Returns a simple lock stats string for diagnostics.
++     */
++    public String lockStats() {
++        int count = this.regionLocks.size();
++        long rA = readAcquired.get();
++        long rR = readReleased.get();
++        long wA = writeAcquired.get();
++        long wR = writeReleased.get();
++        return "regionLocks=" + count + ", read(acq=" + rA + ", rel=" + rR + "), write(acq=" + wA + ", rel=" + wR + ")";
++    }
++
++    /**
++     * Snapshot DTO for diagnostics.
++     */
++    public static final class LockSnapshot {
++        public final int regionLockCount;
++        public final long readAcquired;
++        public final long readReleased;
++        public final long writeAcquired;
++        public final long writeReleased;
++
++        public LockSnapshot(int regionLockCount, long readAcquired, long readReleased, long writeAcquired, long writeReleased) {
++            this.regionLockCount = regionLockCount;
++            this.readAcquired = readAcquired;
++            this.readReleased = readReleased;
++            this.writeAcquired = writeAcquired;
++            this.writeReleased = writeReleased;
++        }
++    }
++
++    /**
++     * Return a snapshot of lock counters for diagnostics.
++     */
++    public LockSnapshot snapshot() {
++        return new LockSnapshot(
++            this.regionLocks.size(),
++            this.readAcquired.get(),
++            this.readReleased.get(),
++            this.writeAcquired.get(),
++            this.writeReleased.get()
++        );
++    }
++
++    static {
++        // Ensure locks are cleared on JVM shutdown as a fallback
++        try {
++            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
++                try { HerculiRegionLocker.instance().shutdown(); } catch (Throwable ignored) {}
++            }, "Herculi-RegionLocks-Shutdown"));
++        } catch (Throwable ignored) {}
++    }
++
++    // Placeholder global lock; not used yet.
++    private final StampedLock globalLock = new StampedLock();
++    // Minimal per-region lock map; enabled only when threading is enabled.
++    private final Map<RegionKey, StampedLock> regionLocks = new ConcurrentHashMap<>();
++    // Contention/diagnostic counters
++    private final AtomicLong readAcquired = new AtomicLong();
++    private final AtomicLong readReleased = new AtomicLong();
++    private final AtomicLong writeAcquired = new AtomicLong();
++    private final AtomicLong writeReleased = new AtomicLong();
++
++    public StampedLock globalLock() {
++        return this.globalLock;
++    }
++
++    /**
++     * Acquire a read lock for the given region. Phase 1: returns a no-op lock.
++     */
++    public RegionLock acquireRead(final RegionKey key) {
++        if (!HerculiConfig.instance().threadingEnabled() || key == null) {
++            return RegionLock.noop();
++        }
++        final StampedLock lock = regionLocks.computeIfAbsent(key, k -> new StampedLock());
++        final long stamp = lock.readLock();
++        readAcquired.incrementAndGet();
++        return RegionLock.of(() -> {
++            try { lock.unlockRead(stamp); } catch (Throwable ignored) {}
++            readReleased.incrementAndGet();
++        });
++    }
++
++    /**
++     * Acquire a write lock for the given region. Phase 1: returns a no-op lock.
++     */
++    public RegionLock acquireWrite(final RegionKey key) {
++        if (!HerculiConfig.instance().threadingEnabled() || key == null) {
++            return RegionLock.noop();
++        }
++        final StampedLock lock = regionLocks.computeIfAbsent(key, k -> new StampedLock());
++        final long stamp = lock.writeLock();
++        writeAcquired.incrementAndGet();
++        return RegionLock.of(() -> {
++            try { lock.unlockWrite(stamp); } catch (Throwable ignored) {}
++            writeReleased.incrementAndGet();
++        });
++    }
++
++    /**
++     * Acquire a neighborhood of write locks around a center region with a square radius.
++     * Locks are acquired in a deterministic order to avoid deadlocks.
++     */
++    public RegionLock acquireWriteNeighborhood(final RegionKey center, final int radius) {
++        if (!HerculiConfig.instance().threadingEnabled() || center == null || radius <= 0) {
++            return RegionLock.noop();
++        }
++        // Build sorted list of neighbor keys
++        final List<RegionKey> keys = new ArrayList<>();
++        for (int dz = -radius; dz <= radius; dz++) {
++            for (int dx = -radius; dx <= radius; dx++) {
++                keys.add(new RegionKey(center.dimension, center.rx + dx, center.rz + dz));
++            }
++        }
++        keys.sort(Comparator
++            .comparingInt((RegionKey k) -> k.rx)
++            .thenComparingInt(k -> k.rz));
++
++        // Acquire all write locks in order, track stamps, and release on close in reverse order
++        final List<StampedLock> locks = new ArrayList<>(keys.size());
++        final List<Long> stamps = new ArrayList<>(keys.size());
++        boolean success = false;
++        try {
++            for (RegionKey k : keys) {
++                final StampedLock l = regionLocks.computeIfAbsent(k, kk -> new StampedLock());
++                final long s = l.writeLock();
++                locks.add(l);
++                stamps.add(s);
++                writeAcquired.incrementAndGet();
++            }
++            success = true;
++        } finally {
++            if (!success) {
++                // best-effort partial unlock if acquisition failed mid-way
++                for (int i = stamps.size() - 1; i >= 0; i--) {
++                    try { locks.get(i).unlockWrite(stamps.get(i)); } catch (Throwable ignored) {} finally { writeReleased.incrementAndGet(); }
++                }
++            }
++        }
++
++        return RegionLock.of(() -> {
++            for (int i = stamps.size() - 1; i >= 0; i--) {
++                try { locks.get(i).unlockWrite(stamps.get(i)); } catch (Throwable ignored) {} finally { writeReleased.incrementAndGet(); }
++            }
++        });
++    }
++
++    /**
++     * Clear all region locks (used on shutdown).
++     */
++    public void shutdown() {
++        regionLocks.clear();
++    }
++}
+diff --git a/src/main/java/io/multipaper/herculi/threading/HerculiRegionScheduler.java b/src/main/java/io/multipaper/herculi/threading/HerculiRegionScheduler.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..d4653fe3e4dfd0a40904645faebcbf54ed485cd4
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/threading/HerculiRegionScheduler.java
+@@ -0,0 +1,27 @@
++package io.multipaper.herculi.threading;
++
++import io.multipaper.herculi.region.RegionKey;
++
++/**
++ * Placeholder for region scheduler scaffolding. The full implementation will
++ * provide per-region executors and handoff mechanisms. This placeholder exists
++ * to allow early anchor integrations to compile without behavior changes.
++ */
++public final class HerculiRegionScheduler {
++    private static final HerculiRegionScheduler INSTANCE = new HerculiRegionScheduler();
++
++    public static HerculiRegionScheduler instance() {
++        return INSTANCE;
++    }
++
++    private HerculiRegionScheduler() {
++    }
++
++    /**
++     * Retrieve a region-affine executor for the given key. Behavior is gated by config
++     * and may return a DIRECT inline executor while threading is disabled.
++     */
++    public RegionExecutor executorFor(final RegionKey key) {
++        return HerculiRegionExecutors.executorFor(key);
++    }
++}
+diff --git a/src/main/java/io/multipaper/herculi/threading/LevelRandomPrecompute.java b/src/main/java/io/multipaper/herculi/threading/LevelRandomPrecompute.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..b3a1b8d8bfcc0047e297a7fa3e3df768f4a43740
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/threading/LevelRandomPrecompute.java
+@@ -0,0 +1,75 @@
++package io.multipaper.herculi.threading;
++
++import io.multipaper.herculi.config.HerculiConfig;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.level.ChunkPos;
++import net.minecraft.world.level.chunk.LevelChunk;
++
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.atomic.AtomicLong;
++
++/**
++ * Tiny read-only precompute for random tick candidate positions.
++ * Default-off, scheduled on the region executor. Results are intentionally discarded
++ * for Phase 0, this only exercises scheduling/cpu without touching game logic.
++ */
++public final class LevelRandomPrecompute {
++    private static final AtomicLong scheduled = new AtomicLong();
++    private static final AtomicLong completed = new AtomicLong();
++    // Tiny cache: chunkKey -> packed candidate triples (rx,ry,rz) repeated; intentionally small and ephemeral
++    private static final ConcurrentHashMap<Long, int[]> cache = new ConcurrentHashMap<>();
++
++    private LevelRandomPrecompute() {}
++
++    public static void schedule(ServerLevel level, LevelChunk chunk, int tickSpeed) {
++        if (level == null || chunk == null) return;
++        if (!HerculiConfig.instance().threadingEnabled()) return;
++        final ChunkPos cpos = chunk.getPos();
++        final int bx = cpos.getMinBlockX();
++        final int bz = cpos.getMinBlockZ();
++        scheduled.incrementAndGet();
++        WorldRegionScheduler.execute(level, bx, bz, () -> {
++            try {
++                // Read-only pseudo-work: derive some positions without touching the world
++                final long seed = ((long)cpos.x * 341873128712L) ^ ((long)cpos.z * 132897987541L) ^ level.getGameTime();
++                long s = seed ^ 0x9E3779B97F4A7C15L;
++                int n = Math.max(1, Math.min(8, tickSpeed));
++                int acc = 0;
++                int[] out = new int[n * 3];
++                for (int i = 0; i < n; i++) {
++                    s ^= (s >>> 30) * 0xBF58476D1CE4E5B9L;
++                    s ^= (s >>> 27) * 0x94D049BB133111EBL;
++                    s ^= (s >>> 31);
++                    int rx = (int)(s & 15L);
++                    int rz = (int)((s >>> 4) & 15L);
++                    int ry = (int)((s >>> 8) & 15L); // section-local; unused
++                    acc ^= (rx << 8) ^ (ry << 4) ^ rz; // prevent JIT dead-code elision
++                    int base = i * 3;
++                    out[base] = rx; out[base + 1] = ry; out[base + 2] = rz;
++                }
++                if (acc == 0x7F7F) {
++                    // impossible guard; no-op
++                }
++                // publish to cache (overwrite is fine)
++                final long key = (((long)cpos.x) << 32) ^ (cpos.z & 0xFFFFFFFFL);
++                cache.put(key, out);
++            } finally {
++                completed.incrementAndGet();
++            }
++        });
++    }
++
++    /**
++     * Retrieve and discard the latest precomputed positions for the given chunk.
++     * Returns null if none available. Main-thread consumption only.
++     */
++    public static int[] poll(ServerLevel level, LevelChunk chunk) {
++        if (level == null || chunk == null) return null;
++        final ChunkPos cpos = chunk.getPos();
++        final long key = (((long)cpos.x) << 32) ^ (cpos.z & 0xFFFFFFFFL);
++        return cache.remove(key);
++    }
++
++    public static long getScheduled() { return scheduled.get(); }
++    public static long getCompleted() { return completed.get(); }
++}
+diff --git a/src/main/java/io/multipaper/herculi/threading/RegionExecutor.java b/src/main/java/io/multipaper/herculi/threading/RegionExecutor.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..4368395badab142fdc2c7bb4217772221cc1475e
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/threading/RegionExecutor.java
+@@ -0,0 +1,14 @@
++package io.multipaper.herculi.threading;
++
++/**
++ * Minimal executor interface for region-affine execution. This is a Phase 1
++ * scaffold and currently executes tasks inline via the default implementation.
++ */
++@FunctionalInterface
++public interface RegionExecutor {
++    void execute(Runnable task);
++
++    RegionExecutor DIRECT = task -> {
++        if (task != null) task.run();
++    };
++}
+diff --git a/src/main/java/io/multipaper/herculi/threading/RegionLock.java b/src/main/java/io/multipaper/herculi/threading/RegionLock.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..970f9856dbbfb7654bd1900ed04f15cc2c408447
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/threading/RegionLock.java
+@@ -0,0 +1,29 @@
++package io.multipaper.herculi.threading;
++
++/**
++ * No-op region lock handle for Phase 1. Real locking will be added later.
++ */
++public final class RegionLock implements AutoCloseable {
++    private static final RegionLock NO_OP = new RegionLock(null);
++    private final Runnable onClose;
++
++    private RegionLock(final Runnable onClose) {
++        this.onClose = onClose;
++    }
++
++    public static RegionLock noop() {
++        return NO_OP;
++    }
++
++    static RegionLock of(final Runnable onClose) {
++        if (onClose == null) return NO_OP;
++        return new RegionLock(onClose);
++    }
++
++    @Override
++    public void close() {
++        if (this.onClose != null) {
++            try { this.onClose.run(); } catch (Throwable ignored) {}
++        }
++    }
++}
+diff --git a/src/main/java/io/multipaper/herculi/threading/RegionSchedulers.java b/src/main/java/io/multipaper/herculi/threading/RegionSchedulers.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..f4ba6cf28bbf33e04cb6a2130f8bfa2481f8c3e1
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/threading/RegionSchedulers.java
+@@ -0,0 +1,121 @@
++package io.multipaper.herculi.threading;
++
++import io.multipaper.herculi.config.HerculiConfig;
++import io.multipaper.herculi.instrumentation.HerculiInstrumentation;
++import org.bukkit.Bukkit;
++import org.bukkit.Location;
++import org.bukkit.entity.Player;
++
++import java.util.Map;
++import java.util.Objects;
++import java.util.concurrent.*;
++
++/**
++ * Phase 2 stub: region executors.
++ * - Computes a region key from player location using HerculiConfig.threadingRegionShift().
++ * - Provides a single-threaded executor per region key.
++ * - For now, region tasks immediately bounce to main thread for Bukkit safety by default.
++ */
++public final class RegionSchedulers {
++    private static final class Holder {
++        final ExecutorService executor;
++        volatile long lastUsedMillis;
++        Holder(ExecutorService ex, long ts) { this.executor = ex; this.lastUsedMillis = ts; }
++    }
++
++    private static final ConcurrentMap<Long, Holder> EXECUTORS = new ConcurrentHashMap<>();
++    private static final HerculiInstrumentation INST = HerculiInstrumentation.instance();
++    private static final java.util.concurrent.atomic.AtomicLong ENQUEUE_COUNT = new java.util.concurrent.atomic.AtomicLong();
++
++    private RegionSchedulers() {}
++
++    public static long regionKeyFor(Location loc) {
++        if (loc == null) return 0L;
++        final int shift = HerculiConfig.instance().threadingRegionShift();
++        final int rx = floorDiv(loc.getBlockX(), 1 << shift);
++        final int rz = floorDiv(loc.getBlockZ(), 1 << shift);
++        return (((long) rx) << 32) ^ (rz & 0xffffffffL);
++    }
++
++    private static int floorDiv(int x, int y) {
++        int r = x / y;
++        // floor division for negatives
++        if ((x ^ y) < 0 && (r * y != x)) r--;
++        return r;
++    }
++
++    private static ExecutorService executorFor(long regionKey) {
++        Holder h = EXECUTORS.computeIfAbsent(regionKey, k -> {
++            ThreadFactory tf = r -> {
++                Thread t = new Thread(r);
++                t.setName("Herculi-RegionExecutor-" + k);
++                t.setDaemon(true);
++                return t;
++            };
++            ExecutorService ex = Executors.newSingleThreadExecutor(tf);
++            INST.incRegionPoolCreated();
++            return new Holder(ex, System.currentTimeMillis());
++        });
++        return h.executor;
++    }
++
++    /**
++     * Execute a task for a player's region. If player is null, runs immediately on the caller thread.
++     */
++    public static void executeFor(Player player, Runnable task) {
++        Objects.requireNonNull(task, "task");
++        if (player == null) {
++            task.run();
++            return;
++        }
++        final long key = regionKeyFor(player.getLocation());
++        // metrics + cleanup sampling
++        INST.incRegionTasksEnqueued();
++        long enq = ENQUEUE_COUNT.incrementAndGet();
++        if (enq % Math.max(1, HerculiConfig.instance().threadingRegionExecutorCleanupEveryEnqueues()) == 0) {
++            sweepIdleExecutors();
++        }
++        Holder holder = EXECUTORS.get(key);
++        if (holder != null) holder.lastUsedMillis = System.currentTimeMillis();
++        executorFor(key).execute(() -> {
++            try {
++                task.run();
++            } finally {
++                INST.incRegionTasksExecuted();
++                Holder h = EXECUTORS.get(key);
++                if (h != null) h.lastUsedMillis = System.currentTimeMillis();
++            }
++        });
++    }
++
++    /**
++     * Execute a task for a player's region, then bounce to the Bukkit main thread for safety.
++     */
++    public static void executeForThenMain(Player player, Runnable task) {
++        Objects.requireNonNull(task, "task");
++        executeFor(player, () -> {
++            if (Bukkit.isPrimaryThread()) {
++                task.run();
++            } else {
++                Bukkit.getScheduler().runTask(Bukkit.getPluginManager().getPlugins()[0], task);
++            }
++        });
++    }
++
++    private static void sweepIdleExecutors() {
++        final long idleMillis = TimeUnit.MINUTES.toMillis(HerculiConfig.instance().threadingRegionExecutorIdleMinutes());
++        final long now = System.currentTimeMillis();
++        for (Map.Entry<Long, Holder> e : EXECUTORS.entrySet()) {
++            Holder h = e.getValue();
++            if (now - h.lastUsedMillis > idleMillis) {
++                if (EXECUTORS.remove(e.getKey(), h)) {
++                    try { h.executor.shutdown(); } catch (Throwable ignored) {}
++                }
++            }
++        }
++    }
++
++    public static int activeExecutorCount() {
++        return EXECUTORS.size();
++    }
++}
+diff --git a/src/main/java/io/multipaper/herculi/threading/WorldRegionScheduler.java b/src/main/java/io/multipaper/herculi/threading/WorldRegionScheduler.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..71d33abcea7aa459fecafc4f926c95ee333643d8
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/threading/WorldRegionScheduler.java
+@@ -0,0 +1,27 @@
++package io.multipaper.herculi.threading;
++
++import io.multipaper.herculi.config.HerculiConfig;
++import io.multipaper.herculi.region.RegionKey;
++import io.multipaper.herculi.region.RegionPos;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.level.ChunkPos;
++
++import java.util.Objects;
++
++/**
++ * Coordinate-based region scheduler. Default-off and no-op when disabled.
++ */
++public final class WorldRegionScheduler {
++
++    private WorldRegionScheduler() {}
++
++    public static void execute(final ServerLevel level, final int blockX, final int blockZ, final Runnable task) {
++        Objects.requireNonNull(level, "level");
++        Objects.requireNonNull(task, "task");
++        if (!HerculiConfig.instance().threadingEnabled()) { task.run(); return; }
++        final ChunkPos pos = new ChunkPos(blockX >> 4, blockZ >> 4);
++        final RegionKey key = RegionKey.of(level.dimension(), RegionPos.forChunk(pos));
++        final RegionExecutor exec = HerculiRegionExecutors.executorFor(key);
++        exec.execute(task);
++    }
++}
+diff --git a/src/main/java/io/multipaper/herculi/timing/HerculiBudgeter.java b/src/main/java/io/multipaper/herculi/timing/HerculiBudgeter.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..76530df29c7479917118736851edf2f4d7686582
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/timing/HerculiBudgeter.java
+@@ -0,0 +1,15 @@
++package io.multipaper.herculi.timing;
++
++/**
++ * Phase 1 scaffolding: Tick budgeter placeholder. Intended to expose
++ * APIs for pacing and fairness controls in later phases. Currently no-op.
++ */
++public final class HerculiBudgeter {
++    private static final HerculiBudgeter INSTANCE = new HerculiBudgeter();
++
++    public static HerculiBudgeter instance() {
++        return INSTANCE;
++    }
++
++    private HerculiBudgeter() {}
++}
+diff --git a/src/main/java/io/multipaper/herculi/util/MainThread.java b/src/main/java/io/multipaper/herculi/util/MainThread.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..cb97b34bb17a0445728ba1f89dad2c7deeda97bd
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/util/MainThread.java
+@@ -0,0 +1,62 @@
++package io.multipaper.herculi.util;
++
++import net.minecraft.server.MinecraftServer;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.atomic.AtomicReference;
++
++/**
++ * Guardrails for ensuring work executes on the main thread when required
++ * (e.g., firing Bukkit events). This class provides minimal utilities
++ * without requiring a Plugin instance.
++ */
++public final class MainThread {
++    private MainThread() {}
++
++    /**
++     * @return true if current thread is the server main thread
++     */
++    public static boolean isMainThread() {
++        final MinecraftServer srv = MinecraftServer.getServer();
++        return srv != null && srv.isSameThread();
++    }
++
++    /**
++     * Execute runnable immediately if current thread is main thread, otherwise schedule on main.
++     */
++    public static void ensure(final Runnable runnable) {
++        if (runnable == null) return;
++        final MinecraftServer srv = MinecraftServer.getServer();
++        if (srv == null) { runnable.run(); return; }
++        if (srv.isSameThread()) {
++            runnable.run();
++        } else {
++            srv.execute(runnable);
++        }
++    }
++
++    /**
++     * Run on main thread and wait for completion. If already on main, runs inline.
++     */
++    public static void runOnMainAndWait(final Runnable runnable) {
++        if (runnable == null) return;
++        final MinecraftServer srv = MinecraftServer.getServer();
++        if (srv == null || srv.isSameThread()) { runnable.run(); return; }
++        final CountDownLatch latch = new CountDownLatch(1);
++        srv.execute(() -> { try { runnable.run(); } finally { latch.countDown(); } });
++        try { latch.await(); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
++    }
++
++    /**
++     * Supply a value from main thread and wait for the result. If already on main, calls inline.
++     */
++    public static <T> T supplyOnMainAndWait(final java.util.function.Supplier<T> supplier) {
++        if (supplier == null) return null;
++        final MinecraftServer srv = MinecraftServer.getServer();
++        if (srv == null || srv.isSameThread()) { return supplier.get(); }
++        final AtomicReference<T> ref = new AtomicReference<>();
++        final CountDownLatch latch = new CountDownLatch(1);
++        srv.execute(() -> { try { ref.set(supplier.get()); } finally { latch.countDown(); } });
++        try { latch.await(); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
++        return ref.get();
++    }
++}
+diff --git a/src/main/java/org/bukkit/craftbukkit/CraftChunk.java b/src/main/java/org/bukkit/craftbukkit/CraftChunk.java
+index 400e632208d133a3f49fc7f14bceb48a1026769b..e587c8419c2e8aa299f72c81f35f94fb87674d9b 100644
+--- a/src/main/java/org/bukkit/craftbukkit/CraftChunk.java
++++ b/src/main/java/org/bukkit/craftbukkit/CraftChunk.java
+@@ -77,6 +77,10 @@ public class CraftChunk implements Chunk {
+     }
+ 
+     public ChunkAccess getHandle(ChunkStatus chunkStatus) {
++        // Herculi - simple guard: warn if off main thread (avoid TickThread dependency)
++        if (!io.multipaper.herculi.util.MainThread.isMainThread()) {
++            org.bukkit.Bukkit.getLogger().warning("[Herculi] Off-main-thread CraftChunk.getHandle: chunkpos=[" + this.x + "," + this.z + "]");
++        }
+         // Paper start - chunk system
+         net.minecraft.world.level.chunk.LevelChunk full = this.level.getChunkIfLoaded(this.x, this.z);
+         if (full != null) {
+diff --git a/src/main/java/org/bukkit/craftbukkit/CraftServer.java b/src/main/java/org/bukkit/craftbukkit/CraftServer.java
+index e62507c532307e6bed6617e0bf1e33e4854a0113..733f1d27f63052b1d750e0adcec265f45e44ef17 100644
+--- a/src/main/java/org/bukkit/craftbukkit/CraftServer.java
++++ b/src/main/java/org/bukkit/craftbukkit/CraftServer.java
+@@ -271,6 +271,7 @@ import org.yaml.snakeyaml.constructor.SafeConstructor;
+ import org.yaml.snakeyaml.error.MarkedYAMLException;
+ 
+ import net.md_5.bungee.api.chat.BaseComponent; // Spigot
++import org.bukkit.craftbukkit.command.HerculiCommand; // Herculi - diagnostics commands
+ 
+ public final class CraftServer implements Server {
+     private final String serverName = io.papermc.paper.ServerBuildInfo.buildInfo().brandName();
+@@ -317,6 +318,13 @@ public final class CraftServer implements Server {
+     public final io.papermc.paper.SparksFly spark;
+     private final ServerConfiguration serverConfig = new PaperServerConfiguration();
+ 
++    // Herculi - guard: warn if events are fired off the main thread
++    private static void ensureMainThread() {
++        if (!io.multipaper.herculi.util.MainThread.isMainThread()) {
++            org.bukkit.Bukkit.getLogger().warning("[Herculi] Bukkit event fired off-main-thread; dispatch should be on main. Call site: CraftServer");
++        }
++    }
++
+     // Paper start - Folia region threading API
+     private final io.papermc.paper.threadedregions.scheduler.FallbackRegionScheduler regionizedScheduler = new io.papermc.paper.threadedregions.scheduler.FallbackRegionScheduler();
+     private final io.papermc.paper.threadedregions.scheduler.FoliaAsyncScheduler asyncScheduler = new io.papermc.paper.threadedregions.scheduler.FoliaAsyncScheduler();
+@@ -429,6 +437,12 @@ public final class CraftServer implements Server {
+         this.paperPluginManager = new io.papermc.paper.plugin.manager.PaperPluginManagerImpl(this, this.commandMap, pluginManager);
+         this.pluginManager.paperPluginManager = this.paperPluginManager;
+          // Paper end
++        // Herculi - register diagnostics root command
++        try {
++            this.commandMap.register("herculi", new HerculiCommand());
++        } catch (Throwable ignored) {
++            // Keep server boot resilient if any class loading issues occur
++        }
+         // Purpur start - Language API
+         org.purpurmc.purpur.language.Language.setLanguage(new org.purpurmc.purpur.language.Language() {
+             private net.minecraft.locale.Language language = net.minecraft.locale.Language.getInstance();
+@@ -511,6 +525,47 @@ public final class CraftServer implements Server {
+         this.potionBrewer = new io.papermc.paper.potion.PaperPotionBrewer(console); // Paper - custom potion mixes
+         datapackManager = new io.papermc.paper.datapack.PaperDatapackManager(console.getPackRepository()); // Paper
+         this.spark = new io.papermc.paper.SparksFly(this); // Paper - spark
++
++        // Herculi - startup diagnostics for configuration flags and broadcasting init
++        try {
++            final io.multipaper.herculi.config.HerculiConfig cfg = io.multipaper.herculi.config.HerculiConfig.instance();
++            final boolean threading = cfg.threadingEnabled();
++            final int poolSize = cfg.threadingRegionPoolSize();
++            final int regionShift = cfg.threadingRegionShift();
++            this.getLogger().info("[Herculi] threading.enabled=" + threading
++                + ", threading.region_pool_size=" + (poolSize <= 0 ? "auto" : poolSize)
++                + ", threading.region_shift=" + regionShift);
++            // Effective config (partial)
++            this.getLogger().info("[Herculi] effective: guardrails=" + cfg.guardrailsEnabled()
++                + ", teleport.enforce_main_thread=" + cfg.teleportEnforceMainThread()
++                + ", portals.routing_enabled=" + cfg.portalRoutingEnabled()
++                + ", handoff.enabled=" + cfg.handoffEnabled());
++
++            // Threaded broadcasting (default-off)
++            final boolean bcEnabled = cfg.broadcastingThreadedEnabled();
++            final int maxQueuesTotal = cfg.broadcastingThreadedMaxQueuesTotal();
++            final int maxBatchesPerQueue = cfg.broadcastingThreadedMaxBatchesPerQueue();
++            final String dropRaw = cfg.broadcastingThreadedDropPolicyRaw();
++            io.multipaper.herculi.broadcast.RecipientQueue.DropPolicy dropPolicy;
++            try {
++                dropPolicy = io.multipaper.herculi.broadcast.RecipientQueue.DropPolicy.valueOf(dropRaw.trim().toUpperCase(java.util.Locale.ROOT));
++            } catch (Throwable ignored2) {
++                dropPolicy = io.multipaper.herculi.broadcast.RecipientQueue.DropPolicy.COALESCE;
++            }
++            // Choose drain budget: prefer fairness budget when fairness.enabled=true
++            // Also initialize fairness singleton budgets
++            try { io.multipaper.herculi.fairness.Fairness.initFromConfig(cfg); } catch (Throwable ignored3) {}
++            final boolean fairness = cfg.fairnessEnabled();
++            final int fairnessBudget = cfg.fairnessBroadcastDrainBudget();
++            final int drainBudget = fairness ? fairnessBudget : cfg.broadcastingThreadedDrainBudget();
++            io.multipaper.herculi.broadcast.BroadcastRegistry.init(bcEnabled, maxQueuesTotal, maxBatchesPerQueue, dropPolicy, drainBudget);
++            this.getLogger().info("[Herculi] broadcasting.threaded.enabled=" + bcEnabled + 
++                ", queuesTotalMax=" + maxQueuesTotal + 
++                ", batchesPerQueueMax=" + maxBatchesPerQueue + 
++                ", dropPolicy=" + dropPolicy + 
++                ", drainBudget=" + drainBudget +
++                (fairness ? " (fairness)" : ""));
++        } catch (Throwable ignored) {}
+     }
+ 
+     public boolean getCommandBlockOverride(String command) {
+@@ -637,6 +692,13 @@ public final class CraftServer implements Server {
+ 
+     public void disablePlugins() {
+         this.pluginManager.disablePlugins();
++        // Herculi - ensure thread pools and region locks are shut down during server stop
++        try {
++            io.multipaper.herculi.threading.HerculiRegionExecutors.shutdown();
++        } catch (Throwable ignored) {}
++        try {
++            io.multipaper.herculi.threading.HerculiRegionLocker.instance().shutdown();
++        } catch (Throwable ignored) {}
+     }
+ 
+     public void syncCommands() {
+@@ -989,6 +1051,8 @@ public final class CraftServer implements Server {
+ 
+     @Override
+     public boolean dispatchCommand(CommandSender rawSender, String commandLine) {
++        // Herculi - Bukkit API thread check (logging-only)
++        io.multipaper.herculi.api.BukkitThreadGuard.ensureMainThread("CraftServer.dispatchCommand");
+         Preconditions.checkArgument(rawSender != null, "sender cannot be null");
+         Preconditions.checkArgument(commandLine != null, "commandLine cannot be null");
+         org.spigotmc.AsyncCatcher.catchOp("Command Dispatched Async: " + commandLine); // Spigot // Paper - Include command in error message
+@@ -1012,10 +1076,12 @@ public final class CraftServer implements Server {
+             commands.performCommand(results, command, true);
+             return true;
+         } catch (CommandException ex) {
++            ensureMainThread();
+             new com.destroystokyo.paper.event.server.ServerExceptionEvent(new com.destroystokyo.paper.exception.ServerCommandException(ex, target, sender, args)).callEvent(); // Paper
+             throw ex;
+         } catch (Throwable ex) {
+             String msg = "Unhandled exception executing '" + command + "' in " + target;
++            ensureMainThread();
+             new com.destroystokyo.paper.event.server.ServerExceptionEvent(new com.destroystokyo.paper.exception.ServerCommandException(ex, target, sender, args)).callEvent(); // Paper
+             throw new CommandException(msg, ex);
+         }
+@@ -1133,6 +1199,7 @@ public final class CraftServer implements Server {
+         this.helpMap.initializeCommands();
+         this.syncCommands(); // Refresh commands after event
+         // Paper end - brigadier command API
++        ensureMainThread();
+         new ServerLoadEvent(ServerLoadEvent.LoadType.RELOAD).callEvent();
+         org.spigotmc.WatchdogThread.hasStarted = true; // Paper - Disable watchdog early timeout on reload
+     }
+@@ -1432,6 +1499,7 @@ public final class CraftServer implements Server {
+         this.getServer().prepareLevels(serverLevel.getChunkSource().chunkMap.progressListener, serverLevel);
+         io.papermc.paper.FeatureHooks.tickEntityManager(serverLevel); // SPIGOT-6526: Load pending entities so they are available to the API // Paper - chunk system
+ 
++        ensureMainThread();
+         new WorldLoadEvent(serverLevel.getWorld()).callEvent();
+         return serverLevel.getWorld();
+     }
+@@ -1463,6 +1531,7 @@ public final class CraftServer implements Server {
+         }
+ 
+         WorldUnloadEvent event = new WorldUnloadEvent(handle.getWorld());
++        ensureMainThread();
+         if (!event.callEvent()) {
+             return false;
+         }
+@@ -2095,6 +2164,7 @@ public final class CraftServer implements Server {
+         }
+ 
+         BroadcastMessageEvent broadcastMessageEvent = new BroadcastMessageEvent(!Bukkit.isPrimaryThread(), message, recipients); // Paper - Adventure
++        ensureMainThread();
+         if (!broadcastMessageEvent.callEvent()) {
+             return 0;
+         }
+@@ -2582,6 +2652,7 @@ public final class CraftServer implements Server {
+         }
+ 
+         TabCompleteEvent tabEvent = new TabCompleteEvent(player, message, offers, message.startsWith("/") || forceCommand, pos != null ? CraftLocation.toBukkit(BlockPos.containing(pos), ((CraftWorld) player.getWorld()).getHandle()) : null); // Paper - AsyncTabCompleteEvent
++        ensureMainThread();
+         tabEvent.callEvent();
+ 
+         return tabEvent.isCancelled() ? Collections.emptyList() : tabEvent.getCompletions();
+@@ -2620,6 +2691,7 @@ public final class CraftServer implements Server {
+                 completions.add(p.getName());
+             }
+         }
++        ensureMainThread();
+         event.callEvent();
+ 
+         Iterator<?> it = completions.iterator();
+diff --git a/src/main/java/org/bukkit/craftbukkit/CraftWorld.java b/src/main/java/org/bukkit/craftbukkit/CraftWorld.java
+index 61121d2efd0df2fcafdc4c272e1cd1b986f42e24..a0e5d1f228c1f2494c7717e064d8d046ecc6a4f1 100644
+--- a/src/main/java/org/bukkit/craftbukkit/CraftWorld.java
++++ b/src/main/java/org/bukkit/craftbukkit/CraftWorld.java
+@@ -177,6 +177,12 @@ public class CraftWorld extends CraftRegionAccessor implements World {
+     private final CraftPersistentDataContainer persistentDataContainer = new CraftPersistentDataContainer(CraftWorld.DATA_TYPE_REGISTRY);
+     // Paper start - void damage configuration
+     private boolean voidDamageEnabled;
++    // Herculi - guard: warn if events are fired off the main thread
++    private static void ensureMainThread() {
++        if (!io.multipaper.herculi.util.MainThread.isMainThread()) {
++            org.bukkit.Bukkit.getLogger().warning("[Herculi] Bukkit event fired off-main-thread; dispatch should be on main. Call site: CraftWorld");
++        }
++    }
+     private float voidDamageAmount;
+     private double voidDamageMinBuildHeightOffset;
+ 
+@@ -377,7 +383,13 @@ public class CraftWorld extends CraftRegionAccessor implements World {
+ 
+     @Override
+     public Chunk getChunkAt(int x, int z) {
++        // Herculi - simple guard: warn if off main thread (avoid TickThread dependency)
++        if (!io.multipaper.herculi.util.MainThread.isMainThread()) {
++            org.bukkit.Bukkit.getLogger().warning("[Herculi] Off-main-thread getChunkAt: world=" + this.world.dimension().location() + ", chunkpos=[" + x + "," + z + "]");
++        }
+         warnUnsafeChunk("getting a faraway chunk", x, z); // Paper
++        // Herculi - best-effort prefetch (gated, no-op by default)
++        try { io.multipaper.herculi.Herculi.maybePrefetchChunk(this.world, new ChunkPos(x, z)); } catch (Throwable ignored) {}
+         net.minecraft.world.level.chunk.LevelChunk chunk = (net.minecraft.world.level.chunk.LevelChunk) this.world.getChunk(x, z, ChunkStatus.FULL, true);
+         return new CraftChunk(chunk);
+     }
+@@ -549,6 +561,8 @@ public class CraftWorld extends CraftRegionAccessor implements World {
+     public boolean loadChunk(int x, int z, boolean generate) {
+         org.spigotmc.AsyncCatcher.catchOp("chunk load"); // Spigot
+         warnUnsafeChunk("loading a faraway chunk", x, z); // Paper
++        // Herculi - best-effort prefetch (gated, no-op by default)
++        try { io.multipaper.herculi.Herculi.maybePrefetchChunk(this.world, new ChunkPos(x, z)); } catch (Throwable ignored) {}
+         ChunkAccess chunk = this.world.getChunkSource().getChunk(x, z, generate || isChunkGenerated(x, z) ? ChunkStatus.FULL : ChunkStatus.EMPTY, true); // Paper
+ 
+         // If generate = false, but the chunk already exists, we will get this back.
+@@ -840,6 +854,7 @@ public class CraftWorld extends CraftRegionAccessor implements World {
+     public void setFullTime(long time) {
+         // Notify anyone who's listening
+         TimeSkipEvent event = new TimeSkipEvent(this, TimeSkipEvent.SkipReason.CUSTOM, time - this.world.getDayTime());
++        ensureMainThread();
+         this.server.getPluginManager().callEvent(event);
+         if (event.isCancelled()) {
+             return;
+@@ -1891,6 +1906,14 @@ public class CraftWorld extends CraftRegionAccessor implements World {
+ 
+     @Override
+     public void playSound(Location loc, Sound sound, org.bukkit.SoundCategory category, float volume, float pitch, long seed) {
++        if (!io.multipaper.herculi.util.MainThread.isMainThread() && io.multipaper.herculi.config.HerculiConfig.instance().handoffEnabled() && io.multipaper.herculi.config.HerculiConfig.instance().handoffSoundsEnabled()) {
++            final Location l = loc == null ? null : loc.clone();
++            if (io.multipaper.herculi.config.HerculiConfig.instance().handoffDebugEnabled()) {
++                org.bukkit.Bukkit.getLogger().fine("[Herculi] Handoff playSound(Location) to main thread at (" + (l != null ? l.getX()+","+l.getY()+","+l.getZ() : "null") + ")");
++            }
++            net.minecraft.server.MinecraftServer.getServer().execute(() -> this.playSound(l, sound, category, volume, pitch, seed));
++            return;
++        }
+         org.spigotmc.AsyncCatcher.catchOp("play sound"); // Paper
+         if (loc == null || sound == null || category == null) return;
+ 
+@@ -1936,18 +1959,45 @@ public class CraftWorld extends CraftRegionAccessor implements World {
+ 
+     @Override
+     public void playSound(Entity entity, Sound sound, org.bukkit.SoundCategory category, float volume, float pitch, long seed) {
++        if (!io.multipaper.herculi.util.MainThread.isMainThread() && io.multipaper.herculi.config.HerculiConfig.instance().handoffEnabled() && io.multipaper.herculi.config.HerculiConfig.instance().handoffSoundsEnabled()) {
++            if (io.multipaper.herculi.config.HerculiConfig.instance().handoffDebugEnabled()) {
++                org.bukkit.Bukkit.getLogger().fine("[Herculi] Handoff playSound(entity,Sound) to main thread for entity=" + entity.getUniqueId());
++            }
++            net.minecraft.server.MinecraftServer.getServer().execute(() -> this.playSound(entity, sound, category, volume, pitch, seed));
++            return;
++        }
+         org.spigotmc.AsyncCatcher.catchOp("play sound"); // Paper
+         if (!(entity instanceof CraftEntity craftEntity) || entity.getWorld() != this || sound == null || category == null) return;
+ 
+-        ClientboundSoundEntityPacket packet = new ClientboundSoundEntityPacket(CraftSound.bukkitToMinecraftHolder(sound), net.minecraft.sounds.SoundSource.valueOf(category.name()), craftEntity.getHandle(), volume, pitch, seed);
+-        ChunkMap.TrackedEntity entityTracker = this.getHandle().getChunkSource().chunkMap.entityMap.get(entity.getEntityId());
+-        if (entityTracker != null) {
+-            entityTracker.broadcastAndSend(packet);
++        final ClientboundSoundEntityPacket packet = new ClientboundSoundEntityPacket(CraftSound.bukkitToMinecraftHolder(sound), net.minecraft.sounds.SoundSource.valueOf(category.name()), craftEntity.getHandle(), volume, pitch, seed);
++        if (io.multipaper.herculi.config.HerculiConfig.instance().handoffEnabled() && io.multipaper.herculi.config.HerculiConfig.instance().handoffTrackerPacketsEnabled() && io.multipaper.herculi.config.HerculiConfig.instance().threadingEnabled()) {
++            if (io.multipaper.herculi.config.HerculiConfig.instance().handoffDebugEnabled()) {
++                org.bukkit.Bukkit.getLogger().fine("[Herculi] Tracker packet emission (entity sound, Sound) via EntityRegionScheduler for entity=" + entity.getUniqueId());
++            }
++            final net.minecraft.world.entity.Entity nms = craftEntity.getHandle();
++            io.multipaper.herculi.threading.EntityRegionScheduler.execute(nms, () -> {
++                ChunkMap.TrackedEntity entityTracker = this.getHandle().getChunkSource().chunkMap.entityMap.get(entity.getEntityId());
++                if (entityTracker != null) {
++                    entityTracker.broadcastAndSend(packet);
++                }
++            });
++        } else {
++            ChunkMap.TrackedEntity entityTracker = this.getHandle().getChunkSource().chunkMap.entityMap.get(entity.getEntityId());
++            if (entityTracker != null) {
++                entityTracker.broadcastAndSend(packet);
++            }
+         }
+     }
+     // Paper start - Adventure
+     @Override
+     public void playSound(final net.kyori.adventure.sound.Sound sound) {
++        if (!io.multipaper.herculi.util.MainThread.isMainThread() && io.multipaper.herculi.config.HerculiConfig.instance().handoffEnabled() && io.multipaper.herculi.config.HerculiConfig.instance().handoffSoundsEnabled()) {
++            if (io.multipaper.herculi.config.HerculiConfig.instance().handoffDebugEnabled()) {
++                org.bukkit.Bukkit.getLogger().fine("[Herculi] Handoff Adventure sound (global) to main thread");
++            }
++            net.minecraft.server.MinecraftServer.getServer().execute(() -> this.playSound(sound));
++            return;
++        }
+         org.spigotmc.AsyncCatcher.catchOp("play sound"); // Paper
+         final long seed = sound.seed().orElseGet(this.world.getRandom()::nextLong);
+         for (ServerPlayer player : this.getHandle().players()) {
+@@ -1957,13 +2007,33 @@ public class CraftWorld extends CraftRegionAccessor implements World {
+ 
+     @Override
+     public void playSound(Entity entity, String sound, org.bukkit.SoundCategory category, float volume, float pitch, long seed) {
++        if (!io.multipaper.herculi.util.MainThread.isMainThread() && io.multipaper.herculi.config.HerculiConfig.instance().handoffEnabled() && io.multipaper.herculi.config.HerculiConfig.instance().handoffSoundsEnabled()) {
++            if (io.multipaper.herculi.config.HerculiConfig.instance().handoffDebugEnabled()) {
++                org.bukkit.Bukkit.getLogger().fine("[Herculi] Handoff playSound(entity,String) to main thread for entity=" + entity.getUniqueId());
++            }
++            net.minecraft.server.MinecraftServer.getServer().execute(() -> this.playSound(entity, sound, category, volume, pitch, seed));
++            return;
++        }
+         org.spigotmc.AsyncCatcher.catchOp("play sound"); // Paper
+         if (!(entity instanceof CraftEntity craftEntity) || entity.getWorld() != this || sound == null || category == null) return;
+ 
+-        ClientboundSoundEntityPacket packet = new ClientboundSoundEntityPacket(Holder.direct(SoundEvent.createVariableRangeEvent(ResourceLocation.parse(sound))), net.minecraft.sounds.SoundSource.valueOf(category.name()), craftEntity.getHandle(), volume, pitch, seed);
+-        ChunkMap.TrackedEntity entityTracker = this.getHandle().getChunkSource().chunkMap.entityMap.get(entity.getEntityId());
+-        if (entityTracker != null) {
+-            entityTracker.broadcastAndSend(packet);
++        final ClientboundSoundEntityPacket packet = new ClientboundSoundEntityPacket(Holder.direct(SoundEvent.createVariableRangeEvent(ResourceLocation.parse(sound))), net.minecraft.sounds.SoundSource.valueOf(category.name()), craftEntity.getHandle(), volume, pitch, seed);
++        if (io.multipaper.herculi.config.HerculiConfig.instance().handoffEnabled() && io.multipaper.herculi.config.HerculiConfig.instance().handoffTrackerPacketsEnabled() && io.multipaper.herculi.config.HerculiConfig.instance().threadingEnabled()) {
++            if (io.multipaper.herculi.config.HerculiConfig.instance().handoffDebugEnabled()) {
++                org.bukkit.Bukkit.getLogger().fine("[Herculi] Tracker packet emission (entity sound, String) via EntityRegionScheduler for entity=" + entity.getUniqueId());
++            }
++            final net.minecraft.world.entity.Entity nms = craftEntity.getHandle();
++            io.multipaper.herculi.threading.EntityRegionScheduler.execute(nms, () -> {
++                ChunkMap.TrackedEntity entityTracker = this.getHandle().getChunkSource().chunkMap.entityMap.get(entity.getEntityId());
++                if (entityTracker != null) {
++                    entityTracker.broadcastAndSend(packet);
++                }
++            });
++        } else {
++            ChunkMap.TrackedEntity entityTracker = this.getHandle().getChunkSource().chunkMap.entityMap.get(entity.getEntityId());
++            if (entityTracker != null) {
++                entityTracker.broadcastAndSend(packet);
++            }
+         }
+     }
+ 
+@@ -2202,6 +2272,14 @@ public class CraftWorld extends CraftRegionAccessor implements World {
+     }
+     @Override
+     public <T> void spawnParticle(Particle particle, List<Player> receivers, Player sender, double x, double y, double z, int count, double offsetX, double offsetY, double offsetZ, double extra, T data, boolean force) {
++        if (!io.multipaper.herculi.util.MainThread.isMainThread() && io.multipaper.herculi.config.HerculiConfig.instance().handoffEnabled() && io.multipaper.herculi.config.HerculiConfig.instance().handoffParticlesEnabled()) {
++            final T capturedData = data; // ensure effectively-final for lambda
++            if (io.multipaper.herculi.config.HerculiConfig.instance().handoffDebugEnabled()) {
++                org.bukkit.Bukkit.getLogger().fine("[Herculi] Handoff particles to main thread at (" + x + "," + y + "," + z + ")");
++            }
++            net.minecraft.server.MinecraftServer.getServer().execute(() -> this.spawnParticle(particle, receivers, sender, x, y, z, count, offsetX, offsetY, offsetZ, extra, capturedData, force));
++            return;
++        }
+         // Paper end - Particle API
+         data = CraftParticle.convertLegacy(data);
+         if (data != null) {
+diff --git a/src/main/java/org/bukkit/craftbukkit/block/CraftBlock.java b/src/main/java/org/bukkit/craftbukkit/block/CraftBlock.java
+index 6809f9dcf8510c714145d99d250eb69f98d9bf27..65283ab6dfa8bdf6a6c080c87a686ca2f903669a 100644
+--- a/src/main/java/org/bukkit/craftbukkit/block/CraftBlock.java
++++ b/src/main/java/org/bukkit/craftbukkit/block/CraftBlock.java
+@@ -64,6 +64,12 @@ import org.bukkit.util.Vector;
+ public class CraftBlock implements Block {
+     private final net.minecraft.world.level.LevelAccessor world;
+     private final BlockPos position;
++    // Herculi - guard: warn if events are fired off the main thread
++    private static void ensureMainThread() {
++        if (!io.multipaper.herculi.util.MainThread.isMainThread()) {
++            org.bukkit.Bukkit.getLogger().warning("[Herculi] Bukkit event fired off-main-thread; dispatch should be on main. Call site: CraftBlock");
++        }
++    }
+ 
+     public CraftBlock(LevelAccessor world, BlockPos position) {
+         this.world = world;
+@@ -75,6 +81,10 @@ public class CraftBlock implements Block {
+     }
+ 
+     public net.minecraft.world.level.block.state.BlockState getNMS() {
++        // Herculi - simple guard: warn if off main thread (avoid TickThread dependency)
++        if (!io.multipaper.herculi.util.MainThread.isMainThread()) {
++            org.bukkit.Bukkit.getLogger().warning("[Herculi] Off-main-thread CraftBlock.getNMS at " + this.position.getX() + "," + this.position.getY() + "," + this.position.getZ());
++        }
+         return this.world.getBlockState(this.position);
+     }
+ 
+@@ -160,6 +170,10 @@ public class CraftBlock implements Block {
+ 
+     @Override
+     public byte getData() {
++        // Herculi - simple guard: warn if off main thread
++        if (!io.multipaper.herculi.util.MainThread.isMainThread()) {
++            org.bukkit.Bukkit.getLogger().warning("[Herculi] Off-main-thread CraftBlock.getData at " + this.position.getX() + "," + this.position.getY() + "," + this.position.getZ());
++        }
+         net.minecraft.world.level.block.state.BlockState state = this.world.getBlockState(this.position);
+         return CraftMagicNumbers.toLegacyData(state);
+     }
+@@ -192,10 +206,18 @@ public class CraftBlock implements Block {
+     }
+ 
+     boolean setBlockState(final net.minecraft.world.level.block.state.BlockState state, final boolean applyPhysics) {
++        // Herculi - simple guard: warn if off main thread
++        if (!io.multipaper.herculi.util.MainThread.isMainThread()) {
++            org.bukkit.Bukkit.getLogger().warning("[Herculi] Off-main-thread CraftBlock.setBlockState at " + this.position.getX() + "," + this.position.getY() + "," + this.position.getZ());
++        }
+         return CraftBlock.setBlockState(this.world, this.position, this.getNMS(), state, applyPhysics);
+     }
+ 
+     public static boolean setBlockState(LevelAccessor world, BlockPos pos, net.minecraft.world.level.block.state.BlockState oldState, net.minecraft.world.level.block.state.BlockState newState, boolean applyPhysics) {
++        // Herculi - simple guard: warn if off main thread
++        if (!io.multipaper.herculi.util.MainThread.isMainThread()) {
++            org.bukkit.Bukkit.getLogger().warning("[Herculi] Off-main-thread CraftBlock.setBlockState(static) at " + pos.getX() + "," + pos.getY() + "," + pos.getZ());
++        }
+         // SPIGOT-611: need to do this to prevent glitchiness. Easier to handle this here (like /setblock) than to fix weirdness in block entity cleanup
+         if (oldState.hasBlockEntity() && newState.getBlock() != oldState.getBlock()) { // SPIGOT-3725 remove old block entity if block changes
+             // SPIGOT-4612: faster - just clear tile
+@@ -227,6 +249,10 @@ public class CraftBlock implements Block {
+ 
+     @Override
+     public Material getType() {
++        // Herculi - simple guard: warn if off main thread
++        if (!io.multipaper.herculi.util.MainThread.isMainThread()) {
++            org.bukkit.Bukkit.getLogger().warning("[Herculi] Off-main-thread CraftBlock.getType at " + this.position.getX() + "," + this.position.getY() + "," + this.position.getZ());
++        }
+         return this.world.getBlockState(this.position).getBukkitMaterial(); // Paper - optimise getType calls
+     }
+ 
+@@ -567,11 +593,13 @@ public class CraftBlock implements Block {
+ 
+             if (treeType != null) {
+                 structureEvent = new StructureGrowEvent(this.getLocation(), treeType, true, null, states);
++                ensureMainThread();
+                 Bukkit.getPluginManager().callEvent(structureEvent);
+             }
+ 
+             event = new BlockFertilizeEvent(CraftBlock.at(world, this.getPosition()), null, states);
+             event.setCancelled(structureEvent != null && structureEvent.isCancelled());
++            ensureMainThread();
+             Bukkit.getPluginManager().callEvent(event);
+ 
+             if (!event.isCancelled()) {
+diff --git a/src/main/java/org/bukkit/craftbukkit/command/HerculiCommand.java b/src/main/java/org/bukkit/craftbukkit/command/HerculiCommand.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..f18bcdf399dd7a6ff5232fefe60f34a5cf3fdcaf
+--- /dev/null
++++ b/src/main/java/org/bukkit/craftbukkit/command/HerculiCommand.java
+@@ -0,0 +1,203 @@
++package org.bukkit.craftbukkit.command;
++
++import org.bukkit.command.Command;
++import org.bukkit.command.CommandSender;
++import org.jetbrains.annotations.NotNull;
++import io.multipaper.herculi.threading.HerculiRegionLocker;
++import io.multipaper.herculi.instrumentation.HerculiInstrumentation;
++
++public final class HerculiCommand extends org.bukkit.command.defaults.BukkitCommand {
++
++    public HerculiCommand() {
++        super("herculi");
++        this.setDescription("Herculi diagnostics and profiling commands");
++        this.setUsage("/herculi <profile|locks|queues|reload> [args]");
++        this.setPermission("herculi.command");
++    }
++
++    @Override
++    public boolean execute(@NotNull CommandSender sender, @NotNull String label, @NotNull String[] args) {
++        if (!this.testPermission(sender)) return true;
++        if (args.length == 0) {
++            sender.sendMessage("Usage: " + this.getUsage());
++            return true;
++        }
++        final String sub = args[0].toLowerCase();
++        switch (sub) {
++            case "reload":
++                io.multipaper.herculi.config.HerculiConfig.instance().reload();
++                try {
++                    final io.multipaper.herculi.config.HerculiConfig cfg = io.multipaper.herculi.config.HerculiConfig.instance();
++                    // refresh fairness
++                    io.multipaper.herculi.fairness.Fairness.initFromConfig(cfg);
++                    // refresh broadcast registry budgets
++                    final boolean bcEnabled = cfg.broadcastingThreadedEnabled();
++                    final int maxQueuesTotal = cfg.broadcastingThreadedMaxQueuesTotal();
++                    final int maxBatchesPerQueue = cfg.broadcastingThreadedMaxBatchesPerQueue();
++                    final String dropRaw = cfg.broadcastingThreadedDropPolicyRaw();
++                    io.multipaper.herculi.broadcast.RecipientQueue.DropPolicy dropPolicy;
++                    try {
++                        dropPolicy = io.multipaper.herculi.broadcast.RecipientQueue.DropPolicy.valueOf(dropRaw.trim().toUpperCase(java.util.Locale.ROOT));
++                    } catch (Throwable ignored) {
++                        dropPolicy = io.multipaper.herculi.broadcast.RecipientQueue.DropPolicy.COALESCE;
++                    }
++                    final int drainBudget = cfg.fairnessEnabled() ? cfg.fairnessBroadcastDrainBudget() : cfg.broadcastingThreadedDrainBudget();
++                    io.multipaper.herculi.broadcast.BroadcastRegistry.init(bcEnabled, maxQueuesTotal, maxBatchesPerQueue, dropPolicy, drainBudget);
++                } catch (Throwable ignored) {}
++                sender.sendMessage("[Herculi] Configuration reloaded (fairness/broadcast budgets updated).");
++                return true;
++            case "profile":
++                if (args.length < 2) {
++                    sender.sendMessage("[Herculi] Usage: /herculi profile <start|stop> [jfr]");
++                    return true;
++                }
++                String action = args[1].toLowerCase();
++                switch (action) {
++                    case "start": {
++                        boolean withJfr = args.length >= 3 && args[2].equalsIgnoreCase("jfr");
++                        String msg = io.multipaper.herculi.instrumentation.HerculiProfiler.instance().start(withJfr);
++                        sender.sendMessage("[Herculi] " + msg);
++                        return true;
++                    }
++                    case "stop": {
++                        String msg = io.multipaper.herculi.instrumentation.HerculiProfiler.instance().stop();
++                        sender.sendMessage("[Herculi] " + msg);
++                        return true;
++                    }
++                    default:
++                        sender.sendMessage("[Herculi] Usage: /herculi profile <start|stop> [jfr]");
++                        return true;
++                }
++            case "locks":
++                try {
++                    final String stats = HerculiRegionLocker.instance().lockStats();
++                    final HerculiInstrumentation inst = HerculiInstrumentation.instance();
++                    final long pools = inst.regionPoolsCreated();
++                    final long enq = inst.regionTasksEnqueued();
++                    final long exe = inst.regionTasksExecuted();
++                    sender.sendMessage("[Herculi] Locks: " + stats
++                        + "; executors: poolsCreated=" + pools
++                        + ", enqueued=" + enq
++                        + ", executed=" + exe);
++                } catch (Throwable t) {
++                    sender.sendMessage("[Herculi] Locks diagnostics unavailable: " + t.getClass().getSimpleName());
++                }
++                return true;
++            case "queues":
++                try {
++                    String snapshot = io.multipaper.herculi.instrumentation.HerculiQueues.instance().snapshot();
++                    sender.sendMessage("[Herculi] Queues: " + snapshot);
++                } catch (Throwable t) {
++                    sender.sendMessage("[Herculi] Queues snapshot unavailable: " + t.getClass().getSimpleName());
++                }
++                return true;
++            case "probe":
++                try {
++                    if (args.length >= 2 && args[1].equalsIgnoreCase("reset")) {
++                        // best-effort reset by reflecting into AtomicLongs if available; otherwise no-op
++                        try {
++                            java.lang.reflect.Field f1 = io.multipaper.herculi.instrumentation.LevelParallelProbe.class.getDeclaredField("scheduled");
++                            java.lang.reflect.Field f2 = io.multipaper.herculi.instrumentation.LevelParallelProbe.class.getDeclaredField("completed");
++                            f1.setAccessible(true); f2.setAccessible(true);
++                            java.util.concurrent.atomic.AtomicLong a1 = (java.util.concurrent.atomic.AtomicLong) f1.get(null);
++                            java.util.concurrent.atomic.AtomicLong a2 = (java.util.concurrent.atomic.AtomicLong) f2.get(null);
++                            a1.set(0L); a2.set(0L);
++                        } catch (Throwable ignored) {}
++                        try {
++                            java.lang.reflect.Field f3 = io.multipaper.herculi.threading.LevelRandomPrecompute.class.getDeclaredField("scheduled");
++                            java.lang.reflect.Field f4 = io.multipaper.herculi.threading.LevelRandomPrecompute.class.getDeclaredField("completed");
++                            f3.setAccessible(true); f4.setAccessible(true);
++                            java.util.concurrent.atomic.AtomicLong a3 = (java.util.concurrent.atomic.AtomicLong) f3.get(null);
++                            java.util.concurrent.atomic.AtomicLong a4 = (java.util.concurrent.atomic.AtomicLong) f4.get(null);
++                            a3.set(0L); a4.set(0L);
++                        } catch (Throwable ignored) {}
++                        try {
++                            io.multipaper.herculi.instrumentation.HerculiUnloadMetrics.reset();
++                        } catch (Throwable ignored) {}
++                        try {
++                            io.multipaper.herculi.instrumentation.HerculiBlockEntityMetrics.reset();
++                        } catch (Throwable ignored) {}
++                        try {
++                            // no reset API for broadcasting; clear by toggling gate if needed
++                        } catch (Throwable ignored) {}
++                        sender.sendMessage("[Herculi] Probe counters reset.");
++                        return true;
++                    }
++                    long lpSched = io.multipaper.herculi.instrumentation.LevelParallelProbe.getScheduled();
++                    long lpDone = io.multipaper.herculi.instrumentation.LevelParallelProbe.getCompleted();
++                    long pcSched = io.multipaper.herculi.threading.LevelRandomPrecompute.getScheduled();
++                    long pcDone = io.multipaper.herculi.threading.LevelRandomPrecompute.getCompleted();
++                    long uCount = 0, uAvgMicros = 0, uMaxMicros = 0;
++                    long beCount = 0, beAvgMicros = 0, beMaxMicros = 0;
++                    long bEnq = 0, bDrained = 0; int bQueues = 0;
++                    long cpHits = 0, cpBuilds = 0;
++                    long trackCapHits = 0;
++                    try {
++                        uCount = io.multipaper.herculi.instrumentation.HerculiUnloadMetrics.getCount();
++                        uAvgMicros = io.multipaper.herculi.instrumentation.HerculiUnloadMetrics.getAvgMicros();
++                        uMaxMicros = io.multipaper.herculi.instrumentation.HerculiUnloadMetrics.getMaxMicros();
++                    } catch (Throwable ignored) {}
++                    try {
++                        beCount = io.multipaper.herculi.instrumentation.HerculiBlockEntityMetrics.getCount();
++                        beAvgMicros = io.multipaper.herculi.instrumentation.HerculiBlockEntityMetrics.getAvgMicros();
++                        beMaxMicros = io.multipaper.herculi.instrumentation.HerculiBlockEntityMetrics.getMaxMicros();
++                    } catch (Throwable ignored) {}
++                    try {
++                        bEnq = io.multipaper.herculi.broadcast.BroadcastManager.instance().getEnqueued();
++                        bDrained = io.multipaper.herculi.broadcast.BroadcastManager.instance().getDrained();
++                        bQueues = io.multipaper.herculi.broadcast.BroadcastManager.instance().getApproxQueueCount();
++                    } catch (Throwable ignored) {}
++                    try {
++                        cpHits = net.minecraft.server.network.PlayerChunkSender.herculi_getCacheHits();
++                        cpBuilds = net.minecraft.server.network.PlayerChunkSender.herculi_getCacheBuilds();
++                    } catch (Throwable ignored) {}
++                    try {
++                        trackCapHits = io.papermc.paper.FeatureHooks.herculi_getTrackingCapHits();
++                    } catch (Throwable ignored) {}
++                    sender.sendMessage("[Herculi] Probe: levelProbe.scheduled=" + lpSched + ", levelProbe.completed=" + lpDone
++                        + ", precompute.scheduled=" + pcSched + ", precompute.completed=" + pcDone
++                        + ", unloads.count=" + uCount + ", unloads.avg_us=" + uAvgMicros + ", unloads.max_us=" + uMaxMicros
++                        + ", be.count=" + beCount + ", be.avg_us=" + beAvgMicros + ", be.max_us=" + beMaxMicros
++                        + ", bq.enqueued=" + bEnq + ", bq.drained=" + bDrained + ", bq.queues=" + bQueues
++                        + ", cp.cache_hits=" + cpHits + ", cp.cache_builds=" + cpBuilds
++                        + ", tracking.cap_hits=" + trackCapHits);
++                } catch (Throwable t) {
++                    sender.sendMessage("[Herculi] Probe unavailable: " + t.getClass().getSimpleName());
++                }
++                return true;
++            default:
++                sender.sendMessage("Unknown subcommand. " + this.getUsage());
++                return true;
++        }
++    }
++
++    @Override
++    public java.util.List<String> tabComplete(@NotNull CommandSender sender, @NotNull String alias, @NotNull String[] args) {
++        java.util.List<String> out = new java.util.ArrayList<>();
++        if (args.length == 1) {
++            java.util.List<String> roots = java.util.Arrays.asList("profile", "locks", "queues", "probe", "reload");
++            String p = args[0].toLowerCase();
++            for (String r : roots) if (r.startsWith(p)) out.add(r);
++            return out;
++        }
++        if (args.length == 2 && args[0].equalsIgnoreCase("probe")) {
++            java.util.List<String> opts = java.util.Arrays.asList("reset");
++            String p = args[1].toLowerCase();
++            for (String r : opts) if (r.startsWith(p)) out.add(r);
++            return out;
++        }
++        if (args.length == 2 && args[0].equalsIgnoreCase("profile")) {
++            java.util.List<String> opts = java.util.Arrays.asList("start", "stop");
++            String p = args[1].toLowerCase();
++            for (String r : opts) if (r.startsWith(p)) out.add(r);
++            return out;
++        }
++        if (args.length == 3 && args[0].equalsIgnoreCase("profile") && args[1].equalsIgnoreCase("start")) {
++            java.util.List<String> opts = java.util.Arrays.asList("jfr");
++            String p = args[2].toLowerCase();
++            for (String r : opts) if (r.startsWith(p)) out.add(r);
++            return out;
++        }
++        return out;
++    }
++}
+diff --git a/src/main/java/org/bukkit/craftbukkit/command/VanillaCommandWrapper.java b/src/main/java/org/bukkit/craftbukkit/command/VanillaCommandWrapper.java
+index f93af795d503a56d60277dadfa5704a6e68073f4..afe2ce747d8975b8b899df3b04095c2cc5a23d2c 100644
+--- a/src/main/java/org/bukkit/craftbukkit/command/VanillaCommandWrapper.java
++++ b/src/main/java/org/bukkit/craftbukkit/command/VanillaCommandWrapper.java
+@@ -50,7 +50,19 @@ public class VanillaCommandWrapper extends BukkitCommand { // Paper
+         if (!this.testPermission(sender)) return true;
+ 
+         CommandSourceStack source = VanillaCommandWrapper.getListener(sender);
+-        this.commands().performPrefixedCommand(source, this.toDispatcher(args, this.getName()));
++        final String toDispatch = this.toDispatcher(args, this.getName());
++        // Herculi: ensure vanilla command execution is marshalled to the correct thread-affine context.
++        if (sender instanceof org.bukkit.craftbukkit.entity.CraftPlayer craftPlayer) {
++            net.minecraft.server.level.ServerPlayer handle = craftPlayer.getHandle();
++            org.bukkit.craftbukkit.util.threading.HerculiSync.ensureSync(handle, () -> this.commands().performPrefixedCommand(source, toDispatch));
++        } else if (sender instanceof org.bukkit.command.BlockCommandSender blockSender) {
++            org.bukkit.Location loc = blockSender.getBlock().getLocation();
++            net.minecraft.server.level.ServerLevel level = ((org.bukkit.craftbukkit.CraftWorld) loc.getWorld()).getHandle();
++            net.minecraft.core.BlockPos pos = new net.minecraft.core.BlockPos(loc.getBlockX(), loc.getBlockY(), loc.getBlockZ());
++            org.bukkit.craftbukkit.util.threading.HerculiSync.ensureSync(level, pos, () -> this.commands().performPrefixedCommand(source, toDispatch));
++        } else {
++            this.commands().performPrefixedCommand(source, toDispatch);
++        }
+         return true;
+     }
+ 
+diff --git a/src/main/java/org/bukkit/craftbukkit/entity/CraftCreeper.java b/src/main/java/org/bukkit/craftbukkit/entity/CraftCreeper.java
+index 2fa2811c3a0afd19ae5ab0b86c679c5062a58ee8..dcce2aa20b2616f34885108e3e8d6b8f09e49dfa 100644
+--- a/src/main/java/org/bukkit/craftbukkit/entity/CraftCreeper.java
++++ b/src/main/java/org/bukkit/craftbukkit/entity/CraftCreeper.java
+@@ -7,6 +7,12 @@ import org.bukkit.entity.Entity;
+ import org.bukkit.event.entity.CreeperPowerEvent;
+ 
+ public class CraftCreeper extends CraftMonster implements Creeper {
++    // Herculi - guard: warn if events are fired off the main thread
++    private static void ensureMainThread() {
++        if (!io.multipaper.herculi.util.MainThread.isMainThread()) {
++            org.bukkit.Bukkit.getLogger().warning("[Herculi] Bukkit event fired off-main-thread; dispatch should be on main. Call site: CraftCreeper");
++        }
++    }
+ 
+     public CraftCreeper(CraftServer server, net.minecraft.world.entity.monster.Creeper entity) {
+         super(server, entity);
+@@ -34,6 +40,7 @@ public class CraftCreeper extends CraftMonster implements Creeper {
+ 
+     private boolean callPowerEvent(CreeperPowerEvent.PowerCause cause) {
+         CreeperPowerEvent event = new CreeperPowerEvent((Creeper) this.getHandle().getBukkitEntity(), cause);
++        ensureMainThread();
+         this.server.getPluginManager().callEvent(event);
+         return event.isCancelled();
+     }
+diff --git a/src/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java b/src/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java
+index 476eefebace887064b728f08af40c746b6f70787..b6f436829c58040c726150d98b05b1a3e35994e9 100644
+--- a/src/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java
++++ b/src/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java
+@@ -97,6 +97,12 @@ public abstract class CraftEntity implements org.bukkit.entity.Entity {
+     private final EntityType entityType;
+     private EntityDamageEvent lastDamageEvent;
+     private final CraftPersistentDataContainer persistentDataContainer = new CraftPersistentDataContainer(CraftEntity.DATA_TYPE_REGISTRY);
++    // Herculi - guard: warn if events are fired off the main thread
++    private static void ensureMainThread() {
++        if (!io.multipaper.herculi.util.MainThread.isMainThread()) {
++            org.bukkit.Bukkit.getLogger().warning("[Herculi] Bukkit event fired off-main-thread; dispatch should be on main. Call site: CraftEntity");
++        }
++    }
+     // Paper start - Folia shedulers
+     public final io.papermc.paper.threadedregions.EntityScheduler taskScheduler = new io.papermc.paper.threadedregions.EntityScheduler(this);
+     private final io.papermc.paper.threadedregions.scheduler.FoliaEntityScheduler apiScheduler = new io.papermc.paper.threadedregions.scheduler.FoliaEntityScheduler(this);
+@@ -338,9 +344,14 @@ public abstract class CraftEntity implements org.bukkit.entity.Entity {
+         // Paper start - fix teleport event not being called
+         org.bukkit.event.entity.EntityTeleportEvent event = new org.bukkit.event.entity.EntityTeleportEvent(
+             this, this.getLocation(), location);
++        if (!io.multipaper.herculi.util.MainThread.isMainThread()) {
++            io.multipaper.herculi.util.MainThread.runOnMainAndWait(event::callEvent);
++        } else {
++            event.callEvent();
++        }
+         // cancelling the event is handled differently for players and entities,
+         // entities just stop teleporting, players will still teleport to the "from" location of the event
+-        if (!event.callEvent() || event.getTo() == null) {
++        if (event.isCancelled() || event.getTo() == null) {
+             return false;
+         }
+         location = event.getTo();
+diff --git a/src/main/java/org/bukkit/craftbukkit/entity/CraftPlayer.java b/src/main/java/org/bukkit/craftbukkit/entity/CraftPlayer.java
+index 4e24a177aed7eda0899b4a1a1e308f02a16c5718..d1f8b76b79b6bd3916e03dd0674790b0642132c8 100644
+--- a/src/main/java/org/bukkit/craftbukkit/entity/CraftPlayer.java
++++ b/src/main/java/org/bukkit/craftbukkit/entity/CraftPlayer.java
+@@ -17,6 +17,7 @@ import io.papermc.paper.entity.PaperPlayerGiveResult;
+ import io.papermc.paper.entity.PlayerGiveResult;
+ import io.papermc.paper.math.Position;
+ import io.papermc.paper.util.MCUtil;
++import io.multipaper.herculi.broadcast.BroadcastManager;
+ import it.unimi.dsi.fastutil.shorts.ShortArraySet;
+ import it.unimi.dsi.fastutil.shorts.ShortSet;
+ import java.io.ByteArrayOutputStream;
+@@ -216,6 +217,24 @@ public class CraftPlayer extends CraftHumanEntity implements Player, PluginMessa
+         .resolving(Identity.LOCALE, Player::locale)
+         .build();
+ 
++    // Herculi - guard: warn if events are fired off the main thread
++    private static void ensureMainThread() {
++        if (!io.multipaper.herculi.config.HerculiConfig.instance().guardrailsEnabled()) {
++            return;
++        }
++        if (!io.multipaper.herculi.util.MainThread.isMainThread()) {
++            org.bukkit.Bukkit.getLogger().warning("[Herculi] Bukkit event fired off-main-thread; dispatch should be on main. Call site: CraftPlayer");
++        }
++    }
++
++    // Herculi - Network fencing helper (Phase 1 instrumentation)
++    private void sendWithFence(net.minecraft.network.protocol.Packet<?> packet, String context) {
++        if (this.getHandle().connection == null) return;
++        io.multipaper.herculi.net.NetworkFence.beforeWrite(context);
++        this.getHandle().connection.send(packet);
++        io.multipaper.herculi.net.NetworkFence.afterWrite(context);
++    }
++
+     private long firstPlayed = 0;
+     private long lastPlayed = 0;
+     private boolean hasPlayedBefore = false;
+@@ -459,13 +478,13 @@ public class CraftPlayer extends CraftHumanEntity implements Player, PluginMessa
+ 
+     @Override
+     public void setTitleTimes(int fadeInTicks, int stayTicks, int fadeOutTicks) {
+-        getHandle().connection.send(new ClientboundSetTitlesAnimationPacket(fadeInTicks, stayTicks, fadeOutTicks));
++        this.sendWithFence(new ClientboundSetTitlesAnimationPacket(fadeInTicks, stayTicks, fadeOutTicks), "title_times");
+     }
+ 
+     @Override
+     public void setSubtitle(BaseComponent[] subtitle) {
+         final ClientboundSetSubtitleTextPacket packet = new ClientboundSetSubtitleTextPacket(org.bukkit.craftbukkit.util.CraftChatMessage.bungeeToVanilla(subtitle));
+-        getHandle().connection.send(packet);
++        this.sendWithFence(packet, "subtitle");
+     }
+ 
+     @Override
+@@ -476,7 +495,7 @@ public class CraftPlayer extends CraftHumanEntity implements Player, PluginMessa
+     @Override
+     public void showTitle(BaseComponent[] title) {
+         final ClientboundSetTitleTextPacket packet = new ClientboundSetTitleTextPacket(org.bukkit.craftbukkit.util.CraftChatMessage.bungeeToVanilla(title));
+-        getHandle().connection.send(packet);
++        this.sendWithFence(packet, "title");
+     }
+ 
+     @Override
+@@ -638,11 +657,13 @@ public class CraftPlayer extends CraftHumanEntity implements Player, PluginMessa
+         if (this.getHandle().connection == null) return;
+ 
+         ClientboundTabListPacket packet = new ClientboundTabListPacket(io.papermc.paper.adventure.PaperAdventure.asVanillaNullToEmpty(this.playerListHeader), io.papermc.paper.adventure.PaperAdventure.asVanillaNullToEmpty(this.playerListFooter)); // Paper - adventure
+-        this.getHandle().connection.send(packet);
++        this.sendWithFence(packet, "tablist");
+     }
+ 
+     @Override
+     public void kickPlayer(String message) {
++        // Herculi - Bukkit API thread check (logging-only)
++        io.multipaper.herculi.api.BukkitThreadGuard.ensureMainThread("CraftPlayer.kickPlayer");
+         org.spigotmc.AsyncCatcher.catchOp("player kick"); // Spigot
+         this.getHandle().connection.disconnect(CraftChatMessage.fromStringOrEmpty(message, true), org.bukkit.event.player.PlayerKickEvent.Cause.PLUGIN); // Paper - kick event cause
+     }
+@@ -651,11 +672,15 @@ public class CraftPlayer extends CraftHumanEntity implements Player, PluginMessa
+ 
+     @Override
+     public void kick() {
++        // Herculi - Bukkit API thread check (logging-only)
++        io.multipaper.herculi.api.BukkitThreadGuard.ensureMainThread("CraftPlayer.kick");
+         this.kick(DEFAULT_KICK_COMPONENT);
+     }
+ 
+     @Override
+     public void kick(net.kyori.adventure.text.Component message, org.bukkit.event.player.PlayerKickEvent.Cause cause) {
++        // Herculi - Bukkit API thread check (logging-only)
++        io.multipaper.herculi.api.BukkitThreadGuard.ensureMainThread("CraftPlayer.kick(Component,Cause)");
+         org.spigotmc.AsyncCatcher.catchOp("player kick");
+         final ServerGamePacketListenerImpl connection = this.getHandle().connection;
+         if (connection != null) {
+@@ -727,6 +752,8 @@ public class CraftPlayer extends CraftHumanEntity implements Player, PluginMessa
+ 
+     @Override
+     public void chat(String msg) {
++        // Herculi - Bukkit API thread check (logging-only)
++        io.multipaper.herculi.api.BukkitThreadGuard.ensureMainThread("CraftPlayer.chat");
+         Preconditions.checkArgument(msg != null, "msg cannot be null");
+ 
+         if (this.getHandle().connection == null) return;
+@@ -749,6 +776,8 @@ public class CraftPlayer extends CraftHumanEntity implements Player, PluginMessa
+ 
+     @Override
+     public boolean performCommand(String command) {
++        // Herculi - Bukkit API thread check (logging-only)
++        io.multipaper.herculi.api.BukkitThreadGuard.ensureMainThread("CraftPlayer.performCommand");
+         Preconditions.checkArgument(command != null, "command cannot be null");
+         return this.server.dispatchCommand(this, command);
+     }
+@@ -941,7 +970,7 @@ public class CraftPlayer extends CraftHumanEntity implements Player, PluginMessa
+         if (this.getHandle().connection == null) return;
+ 
+         ClientboundBlockUpdatePacket packet = new ClientboundBlockUpdatePacket(CraftLocation.toBlockPosition(loc), CraftMagicNumbers.getBlock(material, data));
+-        this.getHandle().connection.send(packet);
++        this.sendWithFence(packet, "block_change");
+     }
+ 
+     @Override
+@@ -949,7 +978,7 @@ public class CraftPlayer extends CraftHumanEntity implements Player, PluginMessa
+         if (this.getHandle().connection == null) return;
+ 
+         ClientboundBlockUpdatePacket packet = new ClientboundBlockUpdatePacket(CraftLocation.toBlockPosition(loc), ((CraftBlockData) block).getState());
+-        this.getHandle().connection.send(packet);
++        this.sendWithFence(packet, "block_change");
+     }
+ 
+     @Override
+@@ -967,12 +996,56 @@ public class CraftPlayer extends CraftHumanEntity implements Player, PluginMessa
+             sectionData.put(SectionPos.sectionRelativePos(blockPos), ((CraftBlockData) blockData).getState());
+         }
+ 
++        // Herculi - Threaded broadcasting (default-off)
++        boolean threaded = io.multipaper.herculi.broadcast.BroadcastRegistry.enabled();
++        if (threaded) {
++            final java.util.UUID uuid = this.getUniqueId();
++            final String worldKey = this.getWorld().getName(); // simple identifier; could be namespaced key if needed
++            java.util.List<net.minecraft.network.protocol.Packet<?>> immediateFallback = null; // lazy
++            for (Map.Entry<SectionPos, it.unimi.dsi.fastutil.shorts.Short2ObjectMap<net.minecraft.world.level.block.state.BlockState>> entry : sectionMap.entrySet()) {
++                SectionPos sectionPos = entry.getKey();
++                it.unimi.dsi.fastutil.shorts.Short2ObjectMap<net.minecraft.world.level.block.state.BlockState> blockData = entry.getValue();
++                final net.minecraft.network.protocol.game.ClientboundSectionBlocksUpdatePacket pkt = new net.minecraft.network.protocol.game.ClientboundSectionBlocksUpdatePacket(sectionPos, blockData);
++                io.multipaper.herculi.broadcast.RecipientQueueKey key = new io.multipaper.herculi.broadcast.RecipientQueueKey(uuid, worldKey, sectionPos.getX(), sectionPos.getZ());
++                boolean offered = io.multipaper.herculi.broadcast.BroadcastRegistry.manager().offer(key, io.multipaper.herculi.broadcast.RecipientQueue.RecipientBatch.single(pkt)).enqueued;
++                if (!offered) {
++                    if (immediateFallback == null) immediateFallback = new java.util.ArrayList<>();
++                    immediateFallback.add(pkt);
++                }
++            }
++            // Fallback send any packets that could not be enqueued
++            if (immediateFallback != null) {
++                for (net.minecraft.network.protocol.Packet<?> pkt : immediateFallback) {
++                    this.getHandle().connection.send(pkt);
++                }
++            }
++            // If we're on main, opportunistically drain a small budget
++            final net.minecraft.server.MinecraftServer srv = net.minecraft.server.MinecraftServer.getServer();
++            if (srv != null && srv.isSameThread()) {
++                final int budget = io.multipaper.herculi.broadcast.BroadcastRegistry.drainBudget();
++                io.multipaper.herculi.broadcast.BroadcastRegistry.manager().drainOnMain((key, batch) -> {
++                    // Only send for this player to avoid cross-recipient accidental draining here
++                    if (!key.playerUuid.equals(uuid)) return Boolean.FALSE;
++                    for (net.minecraft.network.protocol.Packet<?> pkt : batch.packets) {
++                        this.getHandle().connection.send(pkt);
++                    }
++                    return Boolean.TRUE;
++                }, budget);
++            }
++            return;
++        }
++
+         for (Map.Entry<SectionPos, it.unimi.dsi.fastutil.shorts.Short2ObjectMap<net.minecraft.world.level.block.state.BlockState>> entry : sectionMap.entrySet()) {
+             SectionPos sectionPos = entry.getKey();
+             it.unimi.dsi.fastutil.shorts.Short2ObjectMap<net.minecraft.world.level.block.state.BlockState> blockData = entry.getValue();
+ 
+             net.minecraft.network.protocol.game.ClientboundSectionBlocksUpdatePacket packet = new net.minecraft.network.protocol.game.ClientboundSectionBlocksUpdatePacket(sectionPos, blockData);
+-            this.getHandle().connection.send(packet);
++            // Herculi: optionally route through threaded broadcasting manager
++            if (BroadcastManager.instance().enabled()) {
++                BroadcastManager.instance().sendOrEnqueue(this.getHandle(), packet, "section_blocks_update");
++            } else {
++                this.getHandle().connection.send(packet);
++            }
+         }
+     }
+ 
+@@ -1003,7 +1076,12 @@ public class CraftPlayer extends CraftHumanEntity implements Player, PluginMessa
+         for (Map.Entry<SectionPos, ChunkSectionChanges> entry : changes.entrySet()) {
+             ChunkSectionChanges chunkChanges = entry.getValue();
+             ClientboundSectionBlocksUpdatePacket packet = new ClientboundSectionBlocksUpdatePacket(entry.getKey(), chunkChanges.positions(), chunkChanges.blockData().toArray(net.minecraft.world.level.block.state.BlockState[]::new));
+-            this.getHandle().connection.send(packet);
++            // Herculi: optionally route through threaded broadcasting manager
++            if (BroadcastManager.instance().enabled()) {
++                BroadcastManager.instance().sendOrEnqueue(this.getHandle(), packet, "section_blocks_update");
++            } else {
++                this.sendWithFence(packet, "section_blocks_update");
++            }
+         }
+     }
+ 
+@@ -1408,6 +1486,8 @@ public class CraftPlayer extends CraftHumanEntity implements Player, PluginMessa
+     @Override
+     public boolean teleport(Location location, PlayerTeleportEvent.TeleportCause cause) {
+         // Paper start - Teleport API
++        // Herculi: PlayerTeleportEvent must fire on main thread
++        ensureMainThread();
+         return this.teleport(location, cause, new io.papermc.paper.entity.TeleportFlag[0]);
+     }
+ 
+@@ -1437,6 +1517,8 @@ public class CraftPlayer extends CraftHumanEntity implements Player, PluginMessa
+ 
+     @Override
+     public boolean teleport(Location location, org.bukkit.event.player.PlayerTeleportEvent.TeleportCause cause, io.papermc.paper.entity.TeleportFlag... flags) {
++        // Herculi: PlayerTeleportEvent must fire on main thread
++        ensureMainThread();
+         Set<io.papermc.paper.entity.TeleportFlag.Relative> relativeArguments;
+         Set<io.papermc.paper.entity.TeleportFlag> allFlags;
+         if (flags.length == 0) {
+@@ -1492,7 +1574,11 @@ public class CraftPlayer extends CraftHumanEntity implements Player, PluginMessa
+         Location to = location;
+         // Create & Call the Teleport Event.
+         PlayerTeleportEvent event = new PlayerTeleportEvent(this, from, to, cause, Set.copyOf(relativeArguments)); // Paper - Teleport API
+-        this.server.getPluginManager().callEvent(event);
++        if (!io.multipaper.herculi.util.MainThread.isMainThread()) {
++            io.multipaper.herculi.util.MainThread.runOnMainAndWait(() -> this.server.getPluginManager().callEvent(event));
++        } else {
++            this.server.getPluginManager().callEvent(event);
++        }
+ 
+         // Return False to inform the Plugin that the Teleport was unsuccessful/cancelled.
+         if (event.isCancelled()) {
+@@ -2101,7 +2187,8 @@ public class CraftPlayer extends CraftHumanEntity implements Player, PluginMessa
+         Entity other = ((CraftEntity) entity).getHandle();
+         unregisterEntity(other);
+ 
+-        server.getPluginManager().callEvent(new PlayerHideEntityEvent(this, entity));
++        ensureMainThread();
++    server.getPluginManager().callEvent(new PlayerHideEntityEvent(this, entity));
+     }
+     private void unregisterEntity(Entity other) {
+         // Paper end
+@@ -2208,7 +2295,8 @@ public class CraftPlayer extends CraftHumanEntity implements Player, PluginMessa
+             entry.updatePlayer(this.getHandle());
+         }
+ 
+-        this.server.getPluginManager().callEvent(new PlayerShowEntityEvent(this, entity));
++        ensureMainThread();
++    this.server.getPluginManager().callEvent(new PlayerShowEntityEvent(this, entity));
+     }
+     // Paper start
+     @Override
+@@ -2867,24 +2955,24 @@ public class CraftPlayer extends CraftHumanEntity implements Player, PluginMessa
+         this.getHandle().connection.send(new ClientboundSetHealthPacket((float) health, foodLevel, saturation));
+     }
+ 
++    // Paper start - cancellable death event
+     @Override
+     public void sendHealthUpdate() {
+         FoodData foodData = this.getHandle().getFoodData();
+-        // Paper start - cancellable death event
+         ClientboundSetHealthPacket packet = new ClientboundSetHealthPacket(this.getScaledHealth(), foodData.getFoodLevel(), foodData.getSaturationLevel());
+         if (this.getHandle().queueHealthUpdatePacket) {
+             this.getHandle().queuedHealthUpdatePacket = packet;
+         } else {
+-            this.getHandle().connection.send(packet);
++            this.sendWithFence(packet, "health_update");
+         }
+-        // Paper end
+     }
+ 
+-    public void injectScaledMaxHealth(Collection<AttributeInstance> collection, boolean force) {
++    // Purpur/Paper compatibility: inject scaled MAX_HEALTH into attribute syncs
++    public void injectScaledMaxHealth(java.util.Collection<AttributeInstance> collection, boolean force) {
+         if (!this.scaledHealth && !force) {
+             return;
+         }
+-        Iterator<AttributeInstance> iterator = collection.iterator();
++        java.util.Iterator<AttributeInstance> iterator = collection.iterator();
+         while (iterator.hasNext()) {
+             AttributeInstance genericInstance = iterator.next();
+             if (genericInstance.getAttribute() == Attributes.MAX_HEALTH) {
+@@ -3103,7 +3191,7 @@ public class CraftPlayer extends CraftHumanEntity implements Player, PluginMessa
+     public void showDemoScreen() {
+         if (this.getHandle().connection == null) return;
+ 
+-        this.getHandle().connection.send(new ClientboundGameEventPacket(ClientboundGameEventPacket.DEMO_EVENT, ClientboundGameEventPacket.DEMO_PARAM_INTRO));
++        this.sendWithFence(new ClientboundGameEventPacket(ClientboundGameEventPacket.DEMO_EVENT, ClientboundGameEventPacket.DEMO_PARAM_INTRO), "demo_screen");
+     }
+ 
+     @Override
+@@ -3257,7 +3345,7 @@ public class CraftPlayer extends CraftHumanEntity implements Player, PluginMessa
+ 
+     @Override
+     public void clearTitle() {
+-        this.getHandle().connection.send(new net.minecraft.network.protocol.game.ClientboundClearTitlesPacket(false));
++        this.sendWithFence(new net.minecraft.network.protocol.game.ClientboundClearTitlesPacket(false), "clear_title");
+     }
+ 
+     // resetTitle implemented above
+diff --git a/src/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java b/src/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java
+index b4ee0f809c1524c74eca74ee6bc471a3051d92a6..da824b3641f8382339d650511e8ba13ad3c08da0 100644
+--- a/src/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java
++++ b/src/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java
+@@ -1,4 +1,4 @@
+-package org.bukkit.craftbukkit.event;
++    package org.bukkit.craftbukkit.event;
+ 
+ import com.google.common.base.Function;
+ import com.google.common.base.Functions;
+@@ -261,8 +261,19 @@ import org.bukkit.inventory.view.AnvilView;
+ import org.bukkit.potion.PotionEffect;
+ import org.bukkit.util.Vector;
+ import org.jetbrains.annotations.Nullable;
++// Herculi
++import io.multipaper.herculi.util.MainThread;
+ 
+ public class CraftEventFactory {
++    // Herculi - guard: warn if events are fired off the main thread
++    private static void ensureMainThread() {
++        if (!io.multipaper.herculi.config.HerculiConfig.instance().guardrailsEnabled()) {
++            return;
++        }
++        if (!io.multipaper.herculi.util.MainThread.isMainThread()) {
++            org.bukkit.Bukkit.getLogger().warning("[Herculi] Bukkit event fired off-main-thread; dispatch should be on main. Call site: CraftEventFactory");
++        }
++    }
+ 
+     // helper methods
+     private static boolean canBuild(Level world, Player player, int x, int z) {
+@@ -288,6 +299,7 @@ public class CraftEventFactory {
+ 
+     public static boolean callPlayerSignOpenEvent(Player player, Sign sign, Side side, PlayerSignOpenEvent.Cause cause) {
+         final PlayerSignOpenEvent event = new PlayerSignOpenEvent(player, sign, side, cause);
++        ensureMainThread();
+         Bukkit.getPluginManager().callEvent(event);
+         return !event.isCancelled();
+     }
+@@ -305,6 +317,7 @@ public class CraftEventFactory {
+         }, t -> BedEnterResult.OK).map(java.util.function.Function.identity(), java.util.function.Function.identity());
+ 
+         PlayerBedEnterEvent event = new PlayerBedEnterEvent((Player) player.getBukkitEntity(), CraftBlock.at(player.level(), bed), bedEnterResult);
++        ensureMainThread();
+         Bukkit.getServer().getPluginManager().callEvent(event);
+ 
+         Result result = event.useBed();
+@@ -319,6 +332,7 @@ public class CraftEventFactory {
+ 
+     public static EntityEnterLoveModeEvent callEntityEnterLoveModeEvent(net.minecraft.world.entity.player.Player entityHuman, Animal entityAnimal, int loveTicks) {
+         EntityEnterLoveModeEvent entityEnterLoveModeEvent = new EntityEnterLoveModeEvent((Animals) entityAnimal.getBukkitEntity(), entityHuman != null ? entityHuman.getBukkitEntity() : null, loveTicks);
++        ensureMainThread();
+         Bukkit.getPluginManager().callEvent(entityEnterLoveModeEvent);
+         return entityEnterLoveModeEvent;
+     }
+@@ -326,6 +340,7 @@ public class CraftEventFactory {
+     public static PlayerHarvestBlockEvent callPlayerHarvestBlockEvent(Level world, BlockPos pos, net.minecraft.world.entity.player.Player player, InteractionHand hand, List<ItemStack> itemsToHarvest) {
+         List<org.bukkit.inventory.ItemStack> bukkitItemsToHarvest = new ArrayList<>(itemsToHarvest.stream().map(CraftItemStack::asBukkitCopy).collect(Collectors.toList()));
+         PlayerHarvestBlockEvent playerHarvestBlockEvent = new PlayerHarvestBlockEvent((Player) player.getBukkitEntity(), CraftBlock.at(world, pos), CraftEquipmentSlot.getHand(hand), bukkitItemsToHarvest);
++        ensureMainThread();
+         Bukkit.getPluginManager().callEvent(playerHarvestBlockEvent);
+         return playerHarvestBlockEvent;
+     }
+@@ -340,12 +355,14 @@ public class CraftEventFactory {
+         } else {
+             event = new PlayerBucketEntityEvent(player, fish.getBukkitEntity(), CraftItemStack.asBukkitCopy(originalBucket), CraftItemStack.asBukkitCopy(entityBucket), handSlot);
+         }
++        ensureMainThread();
+         Bukkit.getPluginManager().callEvent(event);
+         return event;
+     }
+ 
+     public static TradeSelectEvent callTradeSelectEvent(int newIndex, MerchantMenu merchant) {
+         TradeSelectEvent tradeSelectEvent = new TradeSelectEvent(merchant.getBukkitView(), newIndex);
++        ensureMainThread();
+         Bukkit.getPluginManager().callEvent(tradeSelectEvent);
+         return tradeSelectEvent;
+     }
+@@ -355,6 +372,7 @@ public class CraftEventFactory {
+         Block block = CraftBlock.at(world, position);
+         BlockFace bukkitDirection = CraftBlock.notchToBlockFace(direction);
+         BellRingEvent event = new io.papermc.paper.event.block.BellRingEvent(block, bukkitDirection, (entity != null) ? entity.getBukkitEntity() : null); // Paper - deprecated BellRingEvent
++        ensureMainThread();
+         Bukkit.getPluginManager().callEvent(event);
+         return !event.isCancelled();
+     }
+@@ -362,6 +380,7 @@ public class CraftEventFactory {
+     public static Stream<net.minecraft.world.entity.LivingEntity> handleBellResonateEvent(Level world, BlockPos position, List<LivingEntity> bukkitEntities) {
+         Block block = CraftBlock.at(world, position);
+         BellResonateEvent event = new BellResonateEvent(block, bukkitEntities);
++        ensureMainThread();
+         Bukkit.getPluginManager().callEvent(event);
+         return event.getResonatedEntities().stream().map((bukkitEntity) -> ((CraftLivingEntity) bukkitEntity).getHandle());
+     }
+@@ -380,6 +399,7 @@ public class CraftEventFactory {
+ 
+         EquipmentSlot handSlot = CraftEquipmentSlot.getHand(hand);
+         BlockMultiPlaceEvent event = new BlockMultiPlaceEvent(blockStates, clickedBlock, cplayer.getInventory().getItem(handSlot), cplayer, canBuild, handSlot);
++        ensureMainThread();
+         event.callEvent();
+ 
+         return event;
+@@ -395,6 +415,7 @@ public class CraftEventFactory {
+ 
+         EquipmentSlot handSlot = CraftEquipmentSlot.getHand(hand);
+         BlockPlaceEvent event = new BlockPlaceEvent(placedBlock, replacedSnapshot, clickedBlock, cplayer.getInventory().getItem(handSlot), cplayer, canBuild, handSlot);
++        ensureMainThread();
+         event.callEvent();
+ 
+         return event;
+@@ -407,6 +428,7 @@ public class CraftEventFactory {
+         }
+ 
+         BlockDropItemEvent event = new BlockDropItemEvent(block, state, player.getBukkitEntity(), list);
++        ensureMainThread();
+         Bukkit.getPluginManager().callEvent(event);
+ 
+         if (!event.isCancelled()) {
+@@ -435,6 +457,7 @@ public class CraftEventFactory {
+         org.bukkit.block.BlockFace blockFace = org.bukkit.craftbukkit.block.CraftBlock.notchToBlockFace(clickedFace);
+ 
+         EntityPlaceEvent event = new EntityPlaceEvent(entity.getBukkitEntity(), cplayer, clickedBlock, blockFace, CraftEquipmentSlot.getHand(hand));
++        ensureMainThread();
+         entity.level().getCraftServer().getPluginManager().callEvent(event);
+ 
+         return event;
+@@ -467,6 +490,7 @@ public class CraftEventFactory {
+             ((PlayerBucketEmptyEvent) event).setCancelled(!CraftEventFactory.canBuild(world, cplayer, changed.getX(), changed.getZ()));
+         }
+ 
++        ensureMainThread();
+         event.callEvent();
+ 
+         return event;
+@@ -523,6 +547,7 @@ public class CraftEventFactory {
+         if (cancelledItem) {
+             event.setUseItemInHand(Result.DENY);
+         }
++        ensureMainThread();
+         craftServer.getPluginManager().callEvent(event);
+ 
+         // Purpur start - Ridables
+@@ -548,6 +573,7 @@ public class CraftEventFactory {
+         }
+ 
+         EntityTransformEvent event = new EntityTransformEvent(original.getBukkitEntity(), list, convertType);
++        ensureMainThread();
+         Bukkit.getPluginManager().callEvent(event);
+ 
+         return event;
+@@ -564,6 +590,7 @@ public class CraftEventFactory {
+         }
+ 
+         EntityShootBowEvent event = new EntityShootBowEvent(shooter, itemInHand, itemConsumable, arrow, CraftEquipmentSlot.getHand(hand), force, consumeItem);
++        ensureMainThread();
+         Bukkit.getPluginManager().callEvent(event);
+ 
+         return event;
+@@ -571,6 +598,7 @@ public class CraftEventFactory {
+ 
+     public static VillagerCareerChangeEvent callVillagerCareerChangeEvent(net.minecraft.world.entity.npc.Villager villager, Profession future, VillagerCareerChangeEvent.ChangeReason reason) {
+         VillagerCareerChangeEvent event = new VillagerCareerChangeEvent((Villager) villager.getBukkitEntity(), future, reason);
++        ensureMainThread();
+         Bukkit.getPluginManager().callEvent(event);
+ 
+         return event;
+@@ -581,6 +609,7 @@ public class CraftEventFactory {
+         Block clickedBlock = CraftBlock.at(player.level(), pos);
+ 
+         BlockDamageEvent event = new BlockDamageEvent(player.getBukkitEntity(), clickedBlock, CraftBlock.notchToBlockFace(direction), itemInHand, instaBreak);
++        ensureMainThread();
+         event.callEvent();
+ 
+         return event;
+@@ -591,6 +620,7 @@ public class CraftEventFactory {
+         Block clickedBlock = CraftBlock.at(player.level(), pos);
+ 
+         BlockDamageAbortEvent event = new BlockDamageAbortEvent(player.getBukkitEntity(), clickedBlock, itemInHand);
++        ensureMainThread();
+         event.callEvent();
+ 
+         return event;
+@@ -686,6 +716,7 @@ public class CraftEventFactory {
+         org.bukkit.entity.Entity bukkitEntity = entity.getBukkitEntity();
+ 
+         EntitySpawnEvent event = new EntitySpawnEvent(bukkitEntity);
++        ensureMainThread();
+         bukkitEntity.getServer().getPluginManager().callEvent(event);
+         return event;
+     }
+@@ -695,6 +726,7 @@ public class CraftEventFactory {
+         CraftServer craftServer = (CraftServer) entity.getServer();
+ 
+         CreatureSpawnEvent event = new CreatureSpawnEvent(entity, spawnReason);
++        ensureMainThread();
+         craftServer.getPluginManager().callEvent(event);
+         return event;
+     }
+@@ -705,6 +737,7 @@ public class CraftEventFactory {
+         CraftServer craftServer = (CraftServer) bukkitEntity.getServer();
+ 
+         EntityTameEvent event = new EntityTameEvent((LivingEntity) bukkitEntity, bukkitTamer);
++        ensureMainThread();
+         craftServer.getPluginManager().callEvent(event);
+         return event;
+     }
+@@ -715,6 +748,7 @@ public class CraftEventFactory {
+ 
+         ItemSpawnEvent event = new ItemSpawnEvent(entity);
+ 
++        ensureMainThread();
+         craftServer.getPluginManager().callEvent(event);
+         return event;
+     }
+@@ -724,6 +758,7 @@ public class CraftEventFactory {
+ 
+         ItemDespawnEvent event = new ItemDespawnEvent(entity, entity.getLocation());
+ 
++        ensureMainThread();
+         entity.getServer().getPluginManager().callEvent(event);
+         return event;
+     }
+@@ -734,6 +769,7 @@ public class CraftEventFactory {
+ 
+         ItemMergeEvent event = new ItemMergeEvent(entityMerging, entityMergingWith);
+ 
++        ensureMainThread();
+         Bukkit.getPluginManager().callEvent(event);
+         return !event.isCancelled();
+     }
+@@ -802,6 +838,7 @@ public class CraftEventFactory {
+         io.papermc.paper.event.entity.WaterBottleSplashEvent event = new io.papermc.paper.event.entity.WaterBottleSplashEvent(
+             thrownPotion, hitEntity, hitBlock, hitFace, affectedEntities, rehydrate, extinguish
+         );
++        ensureMainThread();
+         event.callEvent();
+         return event;
+     }
+@@ -1950,6 +1987,7 @@ public class CraftEventFactory {
+         CraftEntity entity = nmsEntity.getBukkitEntity();
+         EntityTeleportEvent event = new org.bukkit.event.entity.EntityTeleportEvent(entity, entity.getLocation(), to);
+ 
++        ensureMainThread();
+         Bukkit.getPluginManager().callEvent(event);
+ 
+         return event;
+diff --git a/src/main/java/org/bukkit/craftbukkit/scheduler/CraftScheduler.java b/src/main/java/org/bukkit/craftbukkit/scheduler/CraftScheduler.java
+index 2e7c3d4befeb6256ce81ecaa9ed4e8fbcb21651e..c44db15b6c191bd0f6d60a900f7e96a0ca5f57d1 100644
+--- a/src/main/java/org/bukkit/craftbukkit/scheduler/CraftScheduler.java
++++ b/src/main/java/org/bukkit/craftbukkit/scheduler/CraftScheduler.java
+@@ -506,6 +506,25 @@ public class CraftScheduler implements BukkitScheduler {
+         this.pending.addAll(temp);
+         temp.clear();
+         //this.debugHead = this.debugHead.getNextHead(this.currentTick); // Paper
++        // Herculi: push tracking caps to NMS (0064) and per-tick broadcast drain (0028)
++        try {
++            // 0064: tracking caps
++            io.multipaper.herculi.config.HerculiConfig cfg = io.multipaper.herculi.config.HerculiConfig.instance();
++            int globalCap = cfg.getInt("tracking.max_trackers_per_entity", 0);
++            int heavyCap = cfg.getInt("tracking.max_trackers_heavy", 0);
++            String typesStr = cfg.getString("tracking.heavy_types", "ITEM,PROJECTILE");
++            java.util.Set<String> typeSet = new java.util.HashSet<>();
++            for (String s : typesStr.split(",")) {
++                if (s != null && !s.isEmpty()) typeSet.add(s.trim().toUpperCase(java.util.Locale.ROOT));
++            }
++            io.papermc.paper.FeatureHooks.herculi_setTrackingCaps(globalCap, heavyCap, typeSet);
++
++            // 0028: periodic drain
++            if (io.multipaper.herculi.config.HerculiConfig.instance().getBoolean("broadcasting.threaded.enabled", false)) {
++                final int budget = Math.max(1, io.multipaper.herculi.config.HerculiConfig.instance().getInt("broadcasting.threaded.perTickDrainBudget", 4));
++                io.multipaper.herculi.broadcast.BroadcastManager.instance().drainAll(budget);
++            }
++        } catch (Throwable ignored) {}
+     }
+ 
+     protected void addTask(final CraftTask task) {
+diff --git a/src/main/java/org/bukkit/craftbukkit/util/threading/HerculiSync.java b/src/main/java/org/bukkit/craftbukkit/util/threading/HerculiSync.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..a6bfe0e070e663ee4471b6ef76671304839ea332
+--- /dev/null
++++ b/src/main/java/org/bukkit/craftbukkit/util/threading/HerculiSync.java
+@@ -0,0 +1,37 @@
++package org.bukkit.craftbukkit.util.threading;
++
++import io.multipaper.herculi.Herculi;
++import net.minecraft.core.BlockPos;
++import net.minecraft.world.entity.Entity;
++import net.minecraft.world.level.Level;
++import java.util.Objects;
++import java.util.concurrent.CompletableFuture;
++import java.util.function.Consumer;
++
++/**
++ * Craft-layer helpers to marshal work through Herculi's thread-affine
++ * no-op shims. These are intentionally thin wrappers so Craft code can
++ * reference them without pulling herculi helpers into NMS.
++ */
++public final class HerculiSync {
++    private HerculiSync() {}
++
++    public static void ensureSync(Entity entity, Runnable task) {
++        Objects.requireNonNull(task, "task");
++        Herculi.ensureSync(entity, task);
++    }
++
++    public static void ensureSync(Entity entity, Consumer<Entity> consumer) {
++        Objects.requireNonNull(consumer, "consumer");
++        Herculi.ensureSync(entity, consumer);
++    }
++
++    public static void ensureSync(Level level, BlockPos pos, Runnable task) {
++        Objects.requireNonNull(task, "task");
++        Herculi.ensureSync(level, pos, task);
++    }
++
++    public static <T> CompletableFuture<T> runSync(Level level, BlockPos pos, CompletableFuture<T> future) {
++        return Herculi.runSync(level, pos, future);
++    }
++}
