@@ -1,0 +1,82 @@
+Mode: Use Cascade Code (not Chat). You will read files, diff patches, and create/update docs.
+Context
+•	Target: Custom Minecraft server fork based on Purpur 1.21.8.
+•	Legacy sources to port/learn from (older, ~1.20.6):
+o	(Xfolder) → MultiPaper; README is at (MultiPaperREADME).
+o	(Yfolder) → ShreddedPaper; README is at (ShreddedPaperREADME).
+•	Patch sets to inspect live under (PatchesFolder).
+•	Objective sequence:
+1.	Finish ShreddedPaper-style multithreading (foundation for concurrency).
+2.	Add/extend public plugin APIs (thread-aware, safe async).
+3.	Then tackle MultiPaper (multi-server/cluster).
+•	There is a rules document you must follow when writing tasks: (path/to/rules-file.md).
+•	Create and maintain a master tasks doc named (Zdocument) at the repo root.
+Hard requirements
+•	Work against Purpur 1.21.8; map breaking changes vs 1.20.6.
+•	Treat any removed/ patch folders as intentional deletions—reflect them as removal/migration tasks (do not re-add them).
+•	Prefer small, verifiable steps; propose branch names and granular commits.
+•	Keep plugin API changes source-compatible where feasible; document migrations when not.
+What to inspect first
+1.	Discover workspace root and confirm Purpur version in build files and server constants.
+2.	Read (ShreddedPaperREADME); in (Yfolder), enumerate all threading/region/locks/executors/chunk I/O/network patches. Summarize each patch’s intent and entry points.
+3.	Read (MultiPaperREADME); in (Xfolder), catalog only cross-server/state-sync/region-ownership patches (no implementation yet).
+4.	Build a diff map: for every patch in (PatchesFolder) across (Yfolder) and (Xfolder), find the 1.21.8 anchoring points and note conflicts/upstream deltas.
+Deliverable: create/update (Zdocument)
+Follow (path/to/rules-file.md) precisely. Populate:
+A. Overview
+•	Goals, versions, repos, porting strategy (1→2→3), and where patch sources live ((PatchesFolder)).
+B. Readiness & Risks
+•	Toolchain versions, build targets, 1.20.6 → 1.21.8 deltas affecting concurrency & networking.
+•	Risk register (deadlocks, memory growth, tick starvation, packet reordering, plugin API breakage) + mitigations & test hooks.
+C. Phase 1 — ShreddedPaper Multithread (implement first)
+Ordered task tree (with dependencies), including:
+•	Scheduler/Executor architecture: thread pools; region/actor model; main-thread boundaries; tick segmentation.
+•	World/Chunk pipeline: async chunk I/O, gen, lighting; entity ticking partitioning & ownership rules.
+•	Networking path: thread-safe handoff for encode/decode; player session state safety.
+•	Locks & ownership: replace coarse locks; document invariants/ownership; evaluate lock-free structures where indicated.
+•	Timing & pacing: budgets, watchdogs, back-pressure, fair scheduling across regions/worlds.
+•	Debug/metrics: per-stage timings, contention counters, deadlock detectors, flamegraph hooks.
+•	Config & feature gates: enable/disable toggles for bisecting regressions.
+•	Compatibility shim layer for Purpur/Bukkit/Spigot/Paper plugin assumptions.
+•	Validation plan: microbench, soak/regression suites (TPS, variance, stutter), with thresholds and dashboards.
+Each task should include:
+•	Rationale (from original patch intent or README notes).
+•	File touchpoints in 1.21.8 (classes/methods).
+•	Acceptance criteria & test notes.
+•	“Blocked by” / “Unblocks” references.
+•	Branch naming suggestion (e.g., feature/shreddedpaper/<task>).
+Capstone for Phase 1 (must-have demo):
+Create a plugin proving thread-safe scheduling by spawning players in different parts of the world according to a region/affinity policy.
+•	Name: RegionSpawnDemo (placeholder).
+•	Goal: On player join/respawn, assign balanced spawn regions without main-thread stalls; verify thread-affinity APIs.
+•	Acceptance: Under synthetic 100–500 concurrent joins, no crashes, no unsafe cross-thread access; TPS remains within agreed thresholds; logs show region-assignment decisions and executor hops; passes soak test.
+D. Phase 2 — Public API Extensions
+•	Enumerate surfaces impacted by Phase 1 (event threading, callback guarantees, thread-affinity rules).
+•	Tasks to expose safe async capabilities: region/affinity executors, async chunk ops, thread-safe world data views, guarded event dispatch.
+•	Deprecation/migration notes for main-thread-only patterns.
+•	Versioning & semantic policy for extended API (pre-release tags if needed).
+E. Phase 3 — MultiPaper (multi-server)
+•	Prereqs from Phase 1/2 (stability gates).
+•	Tasks for region ownership across nodes, handoff protocols, interest management, player routing, and state replication.
+•	Transport/codec choice; ordering/reliability; conflict resolution.
+•	Cluster config, discovery, failure handling (node loss, split-brain prevention).
+•	Test matrix for multi-node sims (single-host multi-process, cross-host).
+F. Engineering Operations
+•	Branching strategy per phase.
+•	CI jobs (build/unit/integration/soak).
+•	Performance dashboards & alerts (TPS, GC, stalls).
+•	Rollback/feature-flag plan.
+G. Appendix
+•	Patch index mapping: (Yfolder)→1.21.8 anchors; (Xfolder)→anchors (catalog only).
+•	Glossary & invariants.
+•	Links to profiling and test scripts.
+How to work
+•	Use Cascade’s file search/terminal to map anchors before editing.
+•	First produce the (Zdocument) skeleton with all sections above, then fill details as you scan source/patches/READMEs.
+•	For ambiguous 1.20.6 patches, propose 1–2 safe 1.21.8 adaptations, pick the least risky, and record the decision.
+•	When encountering a removed/ patch, produce a removal/migration task—don’t port it verbatim.
+Output now (Numbers are flexible, if you need more add more, remember to plan all the tasks, do not miss any)
+1.	Create/Edit (Zdocument) at repo root per (path/to/rules-file.md).
+2.	Populate sections A–G with an initial pass (TBDs allowed where discovery is pending).
+3.	List the first 10 executable Phase-1 tasks with acceptance criteria and file touchpoints so implementation can start immediately.
+4.	Include an explicit task set for the RegionSpawnDemo plugin (capstone for Phase 1), with tests and profiling hooks.

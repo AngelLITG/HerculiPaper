@@ -1,3 +1,52 @@
+# HerculiPaper
+
+HerculiPaper is a performance- and concurrency-focused fork built on top of Purpur 1.21.8. It brings ShreddedPaper-style regionization, guarded threading, and targeted optimizations while preserving plugin compatibility via configuration gates.
+
+## Highlights
+- Region scheduler foundations and guardrails (feature-gated).
+- Safer threading for hot paths (navigating mobs, entity maps, NearbyPlayers).
+- World-gen allocation reductions in decoration loops.
+- Gated instrumentation for unloads and block entity ticks, viewable with `/herculi probe`.
+
+See `HERCULI.md` for configuration keys and feature docs. See `todo-tasks.txt` for ShreddedPaper parity tracking and status.
+
+## Building
+
+Initial setup:
+
+```
+./gradlew applyAllPatches
+```
+
+Build a server-ready jar:
+
+```
+./gradlew createMojmapBundlerJar
+```
+
+Jars are produced under `purpur-server/build/libs`.
+
+## Configuration
+
+On first run, a minimal `config/herculi.yml` is created. All Herculi feature gates are disabled by default for safety. Enable specific toggles only if they show measurable performance benefit in your environment.
+
+Refer to `HERCULI.md` for the keys:
+- `threading.random_precompute.enabled`
+- `instrumentation.unload.metrics_enabled`
+- `instrumentation.block_entities.metrics_enabled`
+- `commands.marshalPerTarget`
+
+## Documentation
+- `HERCULI.md` — feature docs and keys
+- `todo-tasks.txt` — parity plan and status
+
+## Upstream
+HerculiPaper builds on Purpur and Paper. Upstream license notices apply to the original material.
+
+---
+
+Below is the upstream Purpur README kept for reference.
+
 <div align="center">
 
 <a href="https://purpurmc.org">

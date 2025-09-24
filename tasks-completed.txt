@@ -1,0 +1,56 @@
+HerculiPaper — Tasks Completed
+- 0014-Chunk-unloading.patch — DONE
+  - Optimizations: early exit when no block entities; cached blockEntities map; 
+    avoided snapshot allocation with empty/single-viewer handling.
+  - Safety: verified no chunk loads during unload path.
+  - Instrumentation: gated unload timing metrics exposed via /herculi probe; docs updated.
+
+- 0016-EntityLookup-accessibleEntities.patch — DONE
+  - Added low-allocation accessor: EntityLookup.forEachAccessible(Consumer<Entity>) to avoid array copies during iteration.
+
+- 0025-NearbyPlayers.patch — DONE
+  - Verified regionized NearbyPlayers queries usage and thread-safety at call sites (ChunkMap, NaturalSpawner, ServerEntityLookup hooks).
+
+- 0045 Thread-safe scoreboards — Applied
+  - ServerScoreboard: concurrent set/list; synchronized setDisplayObjective.
+  - Scoreboard: concurrent maps; CopyOnWriteArrayList for objectivesByCriteria.
+  - PlayerTeam: thread-safe players set.
+
+- 0048 Synchronize playersSentChunkTo — Applied
+  - ChunkHolder: added playersSentChunkToLock and synchronized add/remove/contains/snapshot.
+
+- 0059 seenBy thread-safety — Applied
+  - ChunkMap.TrackedEntity: seenBy replaced with ConcurrentHashMap-backed set.
+
+- 0052/0053/0066 Craft-layer wiring — Applied
+  - Added Craft helper: org.bukkit.craftbukkit.util.threading.HerculiSync.
+  - VanillaCommandWrapper: marshals execution via HerculiSync for players and block command senders.
+
+
+- 1) Scheduler backbone (regionized executors) — DONE
+\n- 6) Event dispatch guardrails — DONE
+  - Added ensureMainThread() guards across craft layer and CraftEventFactory.
+  - Enforced main-thread dispatch for PlayerTeleportEvent and EntityTeleportEvent using MainThread.runOnMainAndWait.
+  - Added helpers: MainThread.runOnMainAndWait and MainThread.supplyOnMainAndWait.
+  - Guarded/normalized additional events: BellRing, BlockDropItem, BlockPlace/MultiPlace, PlayerBucket*, BlockDamage*, EntityShootBow, VillagerCareerChange,
+    Entity/Creature/Item spawn-despawn-merge, and more where applicable.
+
+- Create Herculi configuration and wire feature gates — DONE
+  - Auto-create `config/herculi.yml` on first run; `/herculi reload` command.
+  - Added gates: guardrails.enabled (default-on), teleport.enforce_main_thread (default-on).
+  - Added handoff gates: threading.handoff.enabled, sounds, particles, tracker_packets, debug (default-off).
+
+- 0012-Level-ticks.patch — DONE
+  - Added `threading.random_precompute.enabled` (default-off) and guarded scheduling in `ServerLevel.tickChunk`.
+  - End-to-end path: scheduled tiny read-only precompute, polled/discarded in `optimiseRandomTick(...)`.
+  - Docs: `HERCULI.md` updated with gate details and usage.
+
+- 0065-Optimization-Cache-chunk-packets.patch — DONE
+  - PlayerChunkSender: per-tick global cache of ClientboundLevelChunkWithLightPacket keyed by (chunkPos, modifyFlag).
+  - Metrics exposed via /herculi probe: cp.cache_hits, cp.cache_builds.
+  - Safe invalidation per tick to avoid stale light/biome data.
+
+- 0028-Threaded-chunk-changes-broadcasting.patch — DONE
+  - BroadcastManager (gated) + CraftPlayer routing for section block updates; per-recipient queues with immediate budgeted drain.
+  - Metrics exposed via /herculi probe: bq.enqueued, bq.drained, bq.queues.
+  - Config keys: broadcasting.threaded.enabled, broadcasting.threaded.maxBatchesPerQueue.

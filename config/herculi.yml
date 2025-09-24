@@ -1,0 +1,36 @@
+# Herculi configuration
+# Minimal key: value format. Unknown keys are ignored.
+
+# Threading and regionization
+threading.enabled: false
+threading.region_pool_size: 0 # 0 or missing = auto (CPU count)
+threading.region_shift: 4      # power-of-two region size in chunks (default 4 => 16x16 chunks per region)
+
+# Async chunk I/O pipeline
+threading.chunk_io_enable: false
+threading.chunk_io_max_inflight: 16
+
+# Networking options
+networking.parallel_flush_enabled: false
+
+# Threaded broadcasting (default-off)
+broadcasting.threaded.enabled: false
+broadcasting.threaded.perRecipientQueues: true
+broadcasting.threaded.maxQueuesTotal: 20000
+broadcasting.threaded.maxQueuesPerPlayer: 512
+broadcasting.threaded.maxBatchesPerQueue: 64
+broadcasting.threaded.dropPolicy: coalesce
+broadcasting.threaded.drainIntervalMs: 2
+
+# Portals/teleportation routing
+portals.routing_enabled: false
+
+# Profiling/diagnostics
+profiling.enabled: false
+
+# Handoff (default-off). When enabled, certain non-critical emissions may be marshalled safely.
+threading.handoff.enabled: false           # master switch
+threading.handoff.sounds: false            # handoff playSound() calls to main thread
+threading.handoff.particles: false         # handoff spawnParticle() calls to main thread
+threading.handoff.tracker_packets: false   # emit certain tracker packets via region scheduler for ordering
+threading.handoff.debug: false             # debug logging for handoffs

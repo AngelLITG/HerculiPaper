@@ -1,0 +1,1074 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Angel <achaparro@lifeisthegame.email>
+Date: Tue, 23 Sep 2025 22:17:50 -0500
+Subject: [PATCH] First patch or smt
+
+
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup.java b/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup.java
+index 2d24d03bbdb5ee0d862cbfff2219f58afffafe12..136479d685654e986c4a46a3606d9ee81efeec90 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup.java
+@@ -179,6 +179,23 @@ public abstract class EntityLookup implements LevelEntityGetter<Entity> {
+         }
+     }
+ 
++    /**
++     * Low-allocation iteration over accessible entities. This avoids allocating a full copy
++     * by iterating the backing array under synchronization. The provided consumer must be
++     * lightweight and must not invoke operations that could re-enter into this lookup to
++     * avoid potential lock contention.
++     */
++    public void forEachAccessible(final Consumer<Entity> action) {
++        Objects.requireNonNull(action, "action");
++        synchronized (this.accessibleEntities) {
++            final Entity[] raw = this.accessibleEntities.getRawData();
++            final int size = this.accessibleEntities.size();
++            for (int i = 0; i < size; i++) {
++                action.accept(raw[i]);
++            }
++        }
++    }
++
+     public Iterable<Entity> getAllMapped() {
+         return this.entityByUUID.values();
+     }
+diff --git a/io/multipaper/herculi/threading/PerThreadNeighborUpdater.java b/io/multipaper/herculi/threading/PerThreadNeighborUpdater.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..89cc6bb499077fd2844888cf373d7603f9fa25e9
+--- /dev/null
++++ b/io/multipaper/herculi/threading/PerThreadNeighborUpdater.java
+@@ -0,0 +1,45 @@
++package io.multipaper.herculi.threading;
++
++import net.minecraft.core.BlockPos;
++import net.minecraft.core.Direction;
++import net.minecraft.world.level.block.Block;
++import net.minecraft.world.level.block.state.BlockState;
++import net.minecraft.world.level.redstone.NeighborUpdater;
++import net.minecraft.world.level.redstone.Orientation;
++import org.jetbrains.annotations.NotNull;
++import org.jetbrains.annotations.Nullable;
++
++import java.util.function.Supplier;
++
++/**
++ * Thread-safe wrapper providing a per-thread NeighborUpdater instance.
++ * This mirrors the approach used in ShreddedPaper: each thread gets its own
++ * CollectingNeighborUpdater to avoid cross-thread races.
++ */
++public final class PerThreadNeighborUpdater implements NeighborUpdater {
++
++    private final ThreadLocal<NeighborUpdater> threadLocalNeighborUpdater;
++
++    public PerThreadNeighborUpdater(Supplier<NeighborUpdater> factory) {
++        this.threadLocalNeighborUpdater = ThreadLocal.withInitial(factory);
++    }
++
++    private NeighborUpdater getOrCreate() {
++        return this.threadLocalNeighborUpdater.get();
++    }
++
++    @Override
++    public void shapeUpdate(@NotNull Direction direction, @NotNull BlockState neighborState, @NotNull BlockPos pos, @NotNull BlockPos neighborPos, int flags, int maxUpdateDepth) {
++        getOrCreate().shapeUpdate(direction, neighborState, pos, neighborPos, flags, maxUpdateDepth);
++    }
++
++    @Override
++    public void neighborChanged(@NotNull BlockPos pos, @NotNull Block sourceBlock, @Nullable Orientation orientation) {
++        getOrCreate().neighborChanged(pos, sourceBlock, orientation);
++    }
++
++    @Override
++    public void neighborChanged(@NotNull BlockState state, @NotNull BlockPos pos, @NotNull Block sourceBlock, @Nullable Orientation orientation, boolean movedByPiston) {
++        getOrCreate().neighborChanged(state, pos, sourceBlock, orientation, movedByPiston);
++    }
++}
+diff --git a/io/papermc/paper/FeatureHooks.java b/io/papermc/paper/FeatureHooks.java
+index df6fbb35e5023b42de0b97434712e04a6b3e66a3..ea805ae0bc720dd97bb362c4e4c70f75f5b09f77 100644
+--- a/io/papermc/paper/FeatureHooks.java
++++ b/io/papermc/paper/FeatureHooks.java
+@@ -25,19 +25,20 @@ import net.minecraft.world.level.biome.Biome;
+ import net.minecraft.world.level.block.Block;
+ import net.minecraft.world.level.block.Blocks;
+ import net.minecraft.world.level.block.state.BlockState;
+-import net.minecraft.world.level.chunk.LevelChunk;
+ import net.minecraft.world.level.chunk.LevelChunkSection;
+ import net.minecraft.world.level.chunk.PalettedContainer;
++import net.minecraft.world.level.chunk.LevelChunk;
+ import org.bukkit.Chunk;
+ import org.bukkit.World;
+ 
+ public final class FeatureHooks {
+ 
++
+     // this includes non-accessible entities
+     public static Iterable<Entity> getAllEntities(final net.minecraft.server.level.ServerLevel world) {
+         return ((ca.spottedleaf.moonrise.patches.chunk_system.level.entity.EntityLookup)world.getEntities()).getAllMapped(); // Paper - rewrite chunk system
+     }
+-
++    
+     public static void setPlayerChunkUnloadDelay(final long ticks) {
+         ca.spottedleaf.moonrise.patches.chunk_system.player.RegionizedPlayerChunkLoader.setUnloadDelay(ticks); // Paper - rewrite chunk system
+     }
+@@ -198,4 +199,21 @@ public final class FeatureHooks {
+         ((ca.spottedleaf.moonrise.patches.chunk_system.player.ChunkSystemServerPlayer)player).moonrise$getViewDistanceHolder().setSendViewDistance(distance); // Paper - rewrite chunk system
+     }
+ 
++    // Herculi - Tracking caps bridge (0064)
++    public static volatile int HERCULI_TRACKING_CAP_GLOBAL = 0; // 0 = disabled
++    public static volatile int HERCULI_TRACKING_CAP_HEAVY = 0;  // 0 = disabled
++    private static volatile java.util.Set<String> HERCULI_TRACKING_HEAVY_TYPES = java.util.Set.of("ITEM", "PROJECTILE");
++    private static final java.util.concurrent.atomic.AtomicLong HERCULI_TRACKING_CAP_HITS = new java.util.concurrent.atomic.AtomicLong();
++
++    public static void herculi_setTrackingCaps(int globalCap, int heavyCap, java.util.Set<String> heavyTypes) {
++        HERCULI_TRACKING_CAP_GLOBAL = Math.max(0, globalCap);
++        HERCULI_TRACKING_CAP_HEAVY = Math.max(0, heavyCap);
++        HERCULI_TRACKING_HEAVY_TYPES = java.util.Set.copyOf(heavyTypes);
++    }
++
++    public static int herculi_getTrackingCapGlobal() { return HERCULI_TRACKING_CAP_GLOBAL; }
++    public static int herculi_getTrackingCapHeavy() { return HERCULI_TRACKING_CAP_HEAVY; }
++    public static java.util.Set<String> herculi_getTrackingHeavyTypes() { return HERCULI_TRACKING_HEAVY_TYPES; }
++    public static void herculi_incTrackingCapHits() { HERCULI_TRACKING_CAP_HITS.incrementAndGet(); }
++    public static long herculi_getTrackingCapHits() { return HERCULI_TRACKING_CAP_HITS.get(); }
+ }
+\ No newline at end of file
+diff --git a/net/minecraft/network/Connection.java b/net/minecraft/network/Connection.java
+index 411e1284a208ca1a097cf6eaa92e1e0d2203d83d..6e4c5b10aeb043c147ebbbb9bfbbb54f5ec4cc22 100644
+--- a/net/minecraft/network/Connection.java
++++ b/net/minecraft/network/Connection.java
+@@ -582,6 +582,13 @@ public class Connection extends SimpleChannelInboundHandler<Packet<?>> {
+     private static int currTick; // Paper - Buffer joins to world
+     private static int tickSecond; // Purpur - Max joins per second
+     public void tick() {
++        // Herculi: guardrail - warn if tick runs off the main server thread (no behavior change)
++        try {
++            final net.minecraft.server.MinecraftServer srv = net.minecraft.server.MinecraftServer.getServer();
++            if (srv != null && !srv.isSameThread()) {
++                LOGGER.debug("[Herculi] Connection.tick invoked off main thread; proceeding with standard logic");
++            }
++        } catch (Throwable ignored) {}
+         this.flushQueue();
+         // Paper start - Buffer joins to world
+         if (Connection.currTick != net.minecraft.server.MinecraftServer.currentTick) {
+diff --git a/net/minecraft/network/protocol/PacketUtils.java b/net/minecraft/network/protocol/PacketUtils.java
+index 4535858701b2bb232b9d2feb2af6551526232ddc..d81f7e1e47df9d21f82ce47d750d472b104078c3 100644
+--- a/net/minecraft/network/protocol/PacketUtils.java
++++ b/net/minecraft/network/protocol/PacketUtils.java
+@@ -20,6 +20,10 @@ public class PacketUtils {
+ 
+     public static <T extends PacketListener> void ensureRunningOnSameThread(Packet<T> packet, T processor, BlockableEventLoop<?> executor) throws RunningOnDifferentThreadException {
+         if (!executor.isSameThread()) {
++            // Herculi: debug-only visibility when cross-thread scheduling occurs (no behavior change)
++            try {
++                LOGGER.debug("[Herculi] Scheduling packet {} for listener {} onto target loop thread", packet != null ? packet.getClass().getSimpleName() : "<null>", processor.getClass().getSimpleName());
++            } catch (Throwable ignored) {}
+             executor.executeIfPossible(() -> {
+                 packetProcessing.push(processor); // Paper - detailed watchdog information
+                 try { // Paper - detailed watchdog information
+diff --git a/net/minecraft/server/ServerScoreboard.java b/net/minecraft/server/ServerScoreboard.java
+index fc1c377ad05edcefacd407671801ae605f3fc31a..a0849131ccfc30737c6d45ff21e691cfa5df9f88 100644
+--- a/net/minecraft/server/ServerScoreboard.java
++++ b/net/minecraft/server/ServerScoreboard.java
+@@ -34,8 +34,8 @@ public class ServerScoreboard extends Scoreboard {
+         }, DataFixTypes.SAVED_DATA_SCOREBOARD
+     );
+     private final MinecraftServer server;
+-    private final Set<Objective> trackedObjectives = Sets.newHashSet();
+-    private final List<Runnable> dirtyListeners = Lists.newArrayList();
++    private final java.util.Set<Objective> trackedObjectives = java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<Objective, Boolean>()); // Herculi - thread-safe
++    private final java.util.List<Runnable> dirtyListeners = new java.util.concurrent.CopyOnWriteArrayList<>(); // Herculi - thread-safe listeners
+ 
+     public ServerScoreboard(MinecraftServer server) {
+         this.server = server;
+@@ -83,7 +83,7 @@ public class ServerScoreboard extends Scoreboard {
+     }
+ 
+     @Override
+-    public void setDisplayObjective(DisplaySlot slot, @Nullable Objective objective) {
++    public synchronized void setDisplayObjective(DisplaySlot slot, @Nullable Objective objective) { // Herculi - synchronize to avoid races
+         Objective displayObjective = this.getDisplayObjective(slot);
+         super.setDisplayObjective(slot, objective);
+         if (displayObjective != objective && displayObjective != null) {
+diff --git a/net/minecraft/server/commands/ClearInventoryCommands.java b/net/minecraft/server/commands/ClearInventoryCommands.java
+index b1866fdf0bacee9ce7ef1fcad4484df5c0d4c640..d8aa1b4710bf5d813e8b31a8b3ee8c7468e61dcb 100644
+--- a/net/minecraft/server/commands/ClearInventoryCommands.java
++++ b/net/minecraft/server/commands/ClearInventoryCommands.java
+@@ -15,6 +15,9 @@ import net.minecraft.commands.arguments.item.ItemPredicateArgument;
+ import net.minecraft.network.chat.Component;
+ import net.minecraft.server.level.ServerPlayer;
+ import net.minecraft.world.item.ItemStack;
++// Herculi start - command marshalling helper
++import io.multipaper.herculi.threading.CommandMarshal;
++// Herculi end
+ 
+ public class ClearInventoryCommands {
+     private static final DynamicCommandExceptionType ERROR_SINGLE = new DynamicCommandExceptionType(
+@@ -73,9 +76,14 @@ public class ClearInventoryCommands {
+         int i = 0;
+ 
+         for (ServerPlayer serverPlayer : targetPlayers) {
+-            i += serverPlayer.getInventory().clearOrCountMatchingItems(itemPredicate, maxCount, serverPlayer.inventoryMenu.getCraftSlots());
+-            serverPlayer.containerMenu.broadcastChanges();
+-            serverPlayer.inventoryMenu.slotsChanged(serverPlayer.getInventory());
++            final ServerPlayer sp = serverPlayer;
++            final int[] delta = new int[1];
++            CommandMarshal.forPlayer(sp.getBukkitEntity(), () -> {
++                delta[0] = sp.getInventory().clearOrCountMatchingItems(itemPredicate, maxCount, sp.inventoryMenu.getCraftSlots());
++                sp.containerMenu.broadcastChanges();
++                sp.inventoryMenu.slotsChanged(sp.getInventory());
++            });
++            i += delta[0];
+         }
+ 
+         if (i == 0) {
+diff --git a/net/minecraft/server/commands/EnchantCommand.java b/net/minecraft/server/commands/EnchantCommand.java
+index 13f1dbd0d09428e9e0a42f99d0553283e0065f6f..b6dc0d6dfd0f94b052f1b0184118ef5cd89ce46f 100644
+--- a/net/minecraft/server/commands/EnchantCommand.java
++++ b/net/minecraft/server/commands/EnchantCommand.java
+@@ -20,6 +20,9 @@ import net.minecraft.world.entity.LivingEntity;
+ import net.minecraft.world.item.ItemStack;
+ import net.minecraft.world.item.enchantment.Enchantment;
+ import net.minecraft.world.item.enchantment.EnchantmentHelper;
++// Herculi start - command marshalling helper
++import io.multipaper.herculi.threading.CommandMarshal;
++// Herculi end
+ 
+ public class EnchantCommand {
+     private static final DynamicCommandExceptionType ERROR_NOT_LIVING_ENTITY = new DynamicCommandExceptionType(
+@@ -77,17 +80,40 @@ public class EnchantCommand {
+ 
+             for (Entity entity : targets) {
+                 if (entity instanceof LivingEntity livingEntity) {
+-                    ItemStack mainHandItem = livingEntity.getMainHandItem();
+-                    if (!mainHandItem.isEmpty()) {
+-                        if (enchantment1.canEnchant(mainHandItem)
+-                            && EnchantmentHelper.isEnchantmentCompatible(EnchantmentHelper.getEnchantmentsForCrafting(mainHandItem).keySet(), enchantment) || (org.purpurmc.purpur.PurpurConfig.allowUnsafeEnchantCommand && !mainHandItem.hasEnchantment(enchantment))) { // Purpur - Config to allow unsafe enchants
+-                            mainHandItem.enchant(enchantment, level);
+-                            i++;
++                    final LivingEntity le = livingEntity;
++                    final boolean[] applied = new boolean[1];
++                    final com.mojang.brigadier.exceptions.CommandSyntaxException[] err = new com.mojang.brigadier.exceptions.CommandSyntaxException[1];
++                    Runnable apply = () -> {
++                        ItemStack mainHandItem = le.getMainHandItem();
++                        if (!mainHandItem.isEmpty()) {
++                            if (enchantment1.canEnchant(mainHandItem)
++                                && EnchantmentHelper.isEnchantmentCompatible(EnchantmentHelper.getEnchantmentsForCrafting(mainHandItem).keySet(), enchantment) || (org.purpurmc.purpur.PurpurConfig.allowUnsafeEnchantCommand && !mainHandItem.hasEnchantment(enchantment))) { // Purpur - Config to allow unsafe enchants
++                                mainHandItem.enchant(enchantment, level);
++                                applied[0] = true;
++                            } else if (targets.size() == 1) {
++                                err[0] = ERROR_INCOMPATIBLE.create(mainHandItem.getHoverName().getString());
++                            }
+                         } else if (targets.size() == 1) {
+-                            throw ERROR_INCOMPATIBLE.create(mainHandItem.getHoverName().getString());
++                            err[0] = ERROR_NO_ITEM.create(le.getName().getString());
+                         }
+-                    } else if (targets.size() == 1) {
+-                        throw ERROR_NO_ITEM.create(livingEntity.getName().getString());
++                    };
++                    if (entity instanceof net.minecraft.server.level.ServerPlayer sp) {
++                        CommandMarshal.forPlayer(sp.getBukkitEntity(), apply);
++                        if (err[0] != null) throw err[0];
++                        if (!applied[0]) {
++                            // verify post-state
++                            ItemStack post = le.getMainHandItem();
++                            if (!post.isEmpty() && post.hasEnchantment(enchantment)) applied[0] = true;
++                        }
++                        if (applied[0]) i++;
++                    } else {
++                        apply.run();
++                        if (err[0] != null) throw err[0];
++                        if (!applied[0]) {
++                            ItemStack post = le.getMainHandItem();
++                            if (!post.isEmpty() && post.hasEnchantment(enchantment)) applied[0] = true;
++                        }
++                        if (applied[0]) i++;
+                     }
+                 } else if (targets.size() == 1) {
+                     throw ERROR_NOT_LIVING_ENTITY.create(entity.getName().getString());
+diff --git a/net/minecraft/server/commands/ExperienceCommand.java b/net/minecraft/server/commands/ExperienceCommand.java
+index 9b33678b109c227ec74c8a5a2204e7f73ff483c4..6d9b13031e3e26dac0d638afbba83a3962600ebf 100644
+--- a/net/minecraft/server/commands/ExperienceCommand.java
++++ b/net/minecraft/server/commands/ExperienceCommand.java
+@@ -16,6 +16,9 @@ import net.minecraft.network.chat.Component;
+ import net.minecraft.server.level.ServerPlayer;
+ import net.minecraft.util.Mth;
+ import net.minecraft.world.entity.player.Player;
++// Herculi start - command marshalling helper
++import io.multipaper.herculi.threading.CommandMarshal;
++// Herculi end
+ 
+ public class ExperienceCommand {
+     private static final SimpleCommandExceptionType ERROR_SET_POINTS_INVALID = new SimpleCommandExceptionType(
+@@ -138,7 +141,8 @@ public class ExperienceCommand {
+ 
+     private static int addExperience(CommandSourceStack source, Collection<? extends ServerPlayer> targets, int amount, ExperienceCommand.Type type) {
+         for (ServerPlayer serverPlayer : targets) {
+-            type.add.accept(serverPlayer, amount);
++            final ServerPlayer sp = serverPlayer;
++            CommandMarshal.forPlayer(sp.getBukkitEntity(), () -> type.add.accept(sp, amount));
+         }
+ 
+         if (targets.size() == 1) {
+@@ -157,9 +161,10 @@ public class ExperienceCommand {
+         int i = 0;
+ 
+         for (ServerPlayer serverPlayer : targets) {
+-            if (type.set.test(serverPlayer, amount)) {
+-                i++;
+-            }
++            final ServerPlayer sp = serverPlayer;
++            final boolean[] ok = new boolean[1];
++            CommandMarshal.forPlayer(sp.getBukkitEntity(), () -> { if (type.set.test(sp, amount)) ok[0] = true; });
++            if (ok[0]) i++;
+         }
+ 
+         if (i == 0) {
+diff --git a/net/minecraft/server/commands/GiveCommand.java b/net/minecraft/server/commands/GiveCommand.java
+index 945d7c0b31fe9ac029e518af92eebd6e8018a69f..85b8a691b372ddcc8462e348f20d6fe3a2121cc9 100644
+--- a/net/minecraft/server/commands/GiveCommand.java
++++ b/net/minecraft/server/commands/GiveCommand.java
+@@ -16,6 +16,9 @@ import net.minecraft.sounds.SoundEvents;
+ import net.minecraft.sounds.SoundSource;
+ import net.minecraft.world.entity.item.ItemEntity;
+ import net.minecraft.world.item.ItemStack;
++// Herculi start - command marshalling helper
++import io.multipaper.herculi.threading.CommandMarshal;
++// Herculi end
+ 
+ public class GiveCommand {
+     public static final int MAX_ALLOWED_ITEMSTACKS = 100;
+@@ -62,40 +65,48 @@ public class GiveCommand {
+             return 0;
+         } else {
+             for (ServerPlayer serverPlayer : targets) {
+-                int i1 = count;
++                final ServerPlayer sp = serverPlayer;
++                CommandMarshal.forPlayer(sp.getBukkitEntity(), () -> {
++                    int i1 = count;
+ 
+-                while (i1 > 0) {
+-                    int min = Math.min(maxStackSize, i1);
+-                    i1 -= min;
+-                    ItemStack itemStack1 = item.createItemStack(min, false);
+-                    boolean flag = serverPlayer.getInventory().add(itemStack1);
+-                    if (org.purpurmc.purpur.PurpurConfig.disableGiveCommandDrops) continue; // Purpur - add config option for toggling give command dropping
+-                    if (flag && itemStack1.isEmpty()) {
+-                        ItemEntity itemEntity = serverPlayer.drop(itemStack, false, false, false, null); // Paper - do not fire PlayerDropItemEvent for /give command
+-                        if (itemEntity != null) {
+-                            itemEntity.makeFakeItem();
++                    while (i1 > 0) {
++                        int min = Math.min(maxStackSize, i1);
++                        i1 -= min;
++                        ItemStack itemStack1;
++                        try {
++                            itemStack1 = item.createItemStack(min, false);
++                        } catch (com.mojang.brigadier.exceptions.CommandSyntaxException e) {
++                            throw new RuntimeException(e);
+                         }
++                        boolean flag = sp.getInventory().add(itemStack1);
++                        if (org.purpurmc.purpur.PurpurConfig.disableGiveCommandDrops) return; // Purpur - add config option for toggling give command dropping
++                        if (flag && itemStack1.isEmpty()) {
++                            ItemEntity itemEntity = sp.drop(itemStack, false, false, false, null); // Paper - do not fire PlayerDropItemEvent for /give command
++                            if (itemEntity != null) {
++                                itemEntity.makeFakeItem();
++                            }
+ 
+-                        serverPlayer.level()
+-                            .playSound(
+-                                null,
+-                                serverPlayer.getX(),
+-                                serverPlayer.getY(),
+-                                serverPlayer.getZ(),
+-                                SoundEvents.ITEM_PICKUP,
+-                                SoundSource.PLAYERS,
+-                                0.2F,
+-                                ((serverPlayer.getRandom().nextFloat() - serverPlayer.getRandom().nextFloat()) * 0.7F + 1.0F) * 2.0F
+-                            );
+-                        serverPlayer.containerMenu.broadcastChanges();
+-                    } else {
+-                        ItemEntity itemEntity = serverPlayer.drop(itemStack1, false, false, false, null); // Paper - do not fire PlayerDropItemEvent for /give command
+-                        if (itemEntity != null) {
+-                            itemEntity.setNoPickUpDelay();
+-                            itemEntity.setTarget(serverPlayer.getUUID());
++                            sp.level()
++                                .playSound(
++                                    null,
++                                    sp.getX(),
++                                    sp.getY(),
++                                    sp.getZ(),
++                                    SoundEvents.ITEM_PICKUP,
++                                    SoundSource.PLAYERS,
++                                    0.2F,
++                                    ((sp.getRandom().nextFloat() - sp.getRandom().nextFloat()) * 0.7F + 1.0F) * 2.0F
++                                );
++                            sp.containerMenu.broadcastChanges();
++                        } else {
++                            ItemEntity itemEntity = sp.drop(itemStack1, false, false, false, null); // Paper - do not fire PlayerDropItemEvent for /give command
++                            if (itemEntity != null) {
++                                itemEntity.setNoPickUpDelay();
++                                itemEntity.setTarget(sp.getUUID());
++                            }
+                         }
+                     }
+-                }
++                });
+             }
+ 
+             if (targets.size() == 1) {
+diff --git a/net/minecraft/server/level/ChunkHolder.java b/net/minecraft/server/level/ChunkHolder.java
+index 656041c9539b6834b4d37b353eb6b810a7763ff4..3ecff2d5529b83f6d7676ff8e9768059b7e53f08 100644
+--- a/net/minecraft/server/level/ChunkHolder.java
++++ b/net/minecraft/server/level/ChunkHolder.java
+@@ -48,6 +48,7 @@ public class ChunkHolder extends GenerationChunkHolder implements ca.spottedleaf
+ 
+     private static final ServerPlayer[] EMPTY_PLAYER_ARRAY = new ServerPlayer[0];
+     private final ca.spottedleaf.moonrise.common.list.ReferenceList<ServerPlayer> playersSentChunkTo = new ca.spottedleaf.moonrise.common.list.ReferenceList<>(EMPTY_PLAYER_ARRAY);
++    private final Object playersSentChunkToLock = new Object(); // Herculi - synchronize playersSentChunkTo access (0048)
+ 
+     private ChunkMap getChunkMap() {
+         return (ChunkMap)this.playerProvider;
+@@ -65,33 +66,46 @@ public class ChunkHolder extends GenerationChunkHolder implements ca.spottedleaf
+ 
+     @Override
+     public final void moonrise$addReceivedChunk(final ServerPlayer player) {
+-        if (!this.playersSentChunkTo.add(player)) {
+-            throw new IllegalStateException("Already sent chunk " + this.pos + " in world '" + ca.spottedleaf.moonrise.common.util.WorldUtil.getWorldName(this.getChunkMap().level) + "' to player " + player);
++        synchronized (this.playersSentChunkToLock) {
++            if (!this.playersSentChunkTo.add(player)) {
++                throw new IllegalStateException("Already sent chunk " + this.pos + " in world '" + ca.spottedleaf.moonrise.common.util.WorldUtil.getWorldName(this.getChunkMap().level) + "' to player " + player);
++            }
+         }
+     }
+ 
+     @Override
+     public final void moonrise$removeReceivedChunk(final ServerPlayer player) {
+-        if (!this.playersSentChunkTo.remove(player)) {
+-            throw new IllegalStateException("Already sent chunk " + this.pos + " in world '" + ca.spottedleaf.moonrise.common.util.WorldUtil.getWorldName(this.getChunkMap().level) + "' to player " + player);
++        synchronized (this.playersSentChunkToLock) {
++            if (!this.playersSentChunkTo.remove(player)) {
++                throw new IllegalStateException("Already sent chunk " + this.pos + " in world '" + ca.spottedleaf.moonrise.common.util.WorldUtil.getWorldName(this.getChunkMap().level) + "' to player " + player);
++            }
+         }
+     }
+ 
+     @Override
+     public final boolean moonrise$hasChunkBeenSent() {
+-        return this.playersSentChunkTo.size() != 0;
++        synchronized (this.playersSentChunkToLock) {
++            return this.playersSentChunkTo.size() != 0;
++        }
+     }
+ 
+     @Override
+     public final boolean moonrise$hasChunkBeenSent(final ServerPlayer to) {
+-        return this.playersSentChunkTo.contains(to);
++        synchronized (this.playersSentChunkToLock) {
++            return this.playersSentChunkTo.contains(to);
++        }
+     }
+ 
+     @Override
+     public final List<ServerPlayer> moonrise$getPlayers(final boolean onlyOnWatchDistanceEdge) {
+         final List<ServerPlayer> ret = new java.util.ArrayList<>();
+-        final ServerPlayer[] raw = this.playersSentChunkTo.getRawDataUnchecked();
+-        for (int i = 0, len = this.playersSentChunkTo.size(); i < len; ++i) {
++        final ServerPlayer[] raw;
++        final int len;
++        synchronized (this.playersSentChunkToLock) {
++            raw = this.playersSentChunkTo.getRawDataUnchecked();
++            len = this.playersSentChunkTo.size();
++        }
++        for (int i = 0; i < len; ++i) {
+             final ServerPlayer player = raw[i];
+             if (onlyOnWatchDistanceEdge && !((ca.spottedleaf.moonrise.patches.chunk_system.level.ChunkSystemServerLevel)this.getChunkMap().level).moonrise$getPlayerChunkLoader().isChunkSent(player, this.pos.x, this.pos.z, onlyOnWatchDistanceEdge)) {
+                 continue;
+diff --git a/net/minecraft/server/level/ChunkMap.java b/net/minecraft/server/level/ChunkMap.java
+index eb352aa4296abc3ed4cf31c590bc0be66daf4de3..72064cf08dbe6272e0b8d3c541b844ac30bd0668 100644
+--- a/net/minecraft/server/level/ChunkMap.java
++++ b/net/minecraft/server/level/ChunkMap.java
+@@ -1142,7 +1142,7 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+         final Entity entity;
+         private final int range;
+         SectionPos lastSectionPos;
+-        public final Set<ServerPlayerConnection> seenBy = new it.unimi.dsi.fastutil.objects.ReferenceOpenHashSet<>(); // Paper - Perf: optimise map impl
++        public final java.util.Set<ServerPlayerConnection> seenBy = java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<ServerPlayerConnection, Boolean>()); // Paper - Perf: optimise map impl; Herculi - thread-safe set to avoid CME
+ 
+         // Paper start - optimise entity tracker
+         private long lastChunkUpdate = -1L;
+@@ -1307,6 +1307,30 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+                 }
+                 // CraftBukkit end
+                 if (flag) {
++                    // Herculi 0064: tracking caps (heavy types + global fallback)
++                    {
++                        int capToUse = 0;
++                        // heavy check by class to avoid string mapping cost
++                        try {
++                            java.util.Set<String> heavyTypes = io.papermc.paper.FeatureHooks.herculi_getTrackingHeavyTypes();
++                            boolean isHeavy = (heavyTypes.contains("ITEM") && (this.entity instanceof net.minecraft.world.entity.item.ItemEntity))
++                                    || (heavyTypes.contains("PROJECTILE") && (this.entity instanceof net.minecraft.world.entity.projectile.Projectile));
++                            if (isHeavy) {
++                                capToUse = io.papermc.paper.FeatureHooks.herculi_getTrackingCapHeavy();
++                            }
++                        } catch (Throwable ignored) {}
++                        if (capToUse <= 0) {
++                            capToUse = io.papermc.paper.FeatureHooks.herculi_getTrackingCapGlobal();
++                        }
++                        if (capToUse > 0) {
++                            // enforce cap before attempting to add
++                            if (this.seenBy.size() >= capToUse) {
++                                // record a cap hit and skip adding this player as a tracker
++                                try { io.papermc.paper.FeatureHooks.herculi_incTrackingCapHits(); } catch (Throwable ignored) {}
++                                return; // do not add tracking for this player
++                            }
++                        }
++                    }
+                     if (this.seenBy.add(player.connection)) {
+                         // Paper start - entity tracking events
+                         if (io.papermc.paper.event.player.PlayerTrackEntityEvent.getHandlerList().getRegisteredListeners().length == 0 || new io.papermc.paper.event.player.PlayerTrackEntityEvent(player.getBukkitEntity(), this.entity.getBukkitEntity()).callEvent()) {
+diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
+index 3c7159d0981c948e71a5612ba4083accb5849ed4..88c90f99750dcba09f44bea5e8489b6bb4c9125f 100644
+--- a/net/minecraft/server/level/ServerLevel.java
++++ b/net/minecraft/server/level/ServerLevel.java
+@@ -152,7 +152,10 @@ import net.minecraft.world.level.material.FluidState;
+ import net.minecraft.world.level.pathfinder.PathTypeCache;
+ import net.minecraft.world.level.portal.PortalForcer;
+ import net.minecraft.world.level.redstone.ExperimentalRedstoneUtils;
++import net.minecraft.world.level.redstone.CollectingNeighborUpdater;
+ import net.minecraft.world.level.redstone.Orientation;
++import io.multipaper.herculi.instrumentation.LevelParallelProbe;
++import io.multipaper.herculi.threading.LevelRandomPrecompute;
+ import net.minecraft.world.level.saveddata.maps.MapId;
+ import net.minecraft.world.level.saveddata.maps.MapIndex;
+ import net.minecraft.world.level.saveddata.maps.MapItemSavedData;
+@@ -193,7 +196,8 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+     private final LevelTicks<Block> blockTicks = new LevelTicks<>(this::isPositionTickingWithEntitiesLoaded);
+     private final LevelTicks<Fluid> fluidTicks = new LevelTicks<>(this::isPositionTickingWithEntitiesLoaded);
+     private final PathTypeCache pathTypesByPosCache = new PathTypeCache();
+-    final Set<Mob> navigatingMobs = new ObjectOpenHashSet<>();
++    // Herculi: thread-safe set for navigating mobs (Task 26)
++    final Set<Mob> navigatingMobs = java.util.concurrent.ConcurrentHashMap.newKeySet();
+     volatile boolean isUpdatingNavigations;
+     protected final Raids raids;
+     private final ObjectLinkedOpenHashSet<BlockEventData> blockEvents = new ObjectLinkedOpenHashSet<>();
+@@ -906,6 +910,10 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+     private final ca.spottedleaf.moonrise.common.util.SimpleThreadUnsafeRandom simpleRandom = new ca.spottedleaf.moonrise.common.util.SimpleThreadUnsafeRandom(net.minecraft.world.level.levelgen.RandomSupport.generateUniqueSeed());
+ 
+     private void optimiseRandomTick(final LevelChunk chunk, final int tickSpeed) {
++        // Herculi: probe region scheduling (no-op) for Task 18 scaffolding
++        try { LevelParallelProbe.probe(this, chunk); } catch (Throwable ignored) {}
++        // Herculi: poll and discard any precomputed candidates (end-to-end path visibility)
++        try { io.multipaper.herculi.threading.LevelRandomPrecompute.poll(this, chunk); } catch (Throwable ignored) {}
+         final LevelChunkSection[] sections = chunk.getSections();
+         final int minSection = ca.spottedleaf.moonrise.common.util.WorldUtil.getMinSection((ServerLevel)(Object)this);
+         final ca.spottedleaf.moonrise.common.util.SimpleThreadUnsafeRandom simpleRandom = this.simpleRandom;
+@@ -972,6 +980,10 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+ 
+         profilerFiller.popPush("tickBlocks");
+         if (randomTickSpeed > 0) {
++            // Herculi: schedule tiny off-thread precompute (read-only) prior to random tick processing (gated)
++            if (io.multipaper.herculi.config.HerculiConfig.instance().randomPrecomputeEnabled()) {
++                try { LevelRandomPrecompute.schedule(this, chunk, randomTickSpeed); } catch (Throwable ignored) {}
++            }
+             this.optimiseRandomTick(chunk, randomTickSpeed); // Paper - optimise random ticking
+         }
+ 
+@@ -979,6 +991,8 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+     }
+ 
+     public void tickThunder(LevelChunk chunk) {
++        // Herculi: probe region scheduling (no-op) for Task 18 scaffolding
++        try { LevelParallelProbe.probe(this, chunk); } catch (Throwable ignored) {}
+         ChunkPos pos = chunk.getPos();
+         boolean isRaining = this.isRaining();
+         int minBlockX = pos.getMinBlockX();
+@@ -1669,13 +1683,35 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+ 
+     public void unload(LevelChunk chunk) {
+         // Spigot start
+-        for (net.minecraft.world.level.block.entity.BlockEntity blockEntity : chunk.getBlockEntities().values()) {
++        // Herculi: optional unload timing metrics (gated)
++        long __unloadStart = 0L;
++        if (io.multipaper.herculi.config.HerculiConfig.instance().instrumentationUnloadMetricsEnabled()) {
++            try { __unloadStart = io.multipaper.herculi.instrumentation.HerculiUnloadMetrics.start(); } catch (Throwable ignored) {}
++        }
++        try {
++        // Herculi: fast-path when there are no block entities
++        final java.util.Map<?, net.minecraft.world.level.block.entity.BlockEntity> blockEntities = chunk.getBlockEntities();
++        if (blockEntities.isEmpty()) {
++            chunk.clearAllBlockEntities();
++            chunk.unregisterTickContainerFromLevel(this);
++            return;
++        }
++        for (net.minecraft.world.level.block.entity.BlockEntity blockEntity : blockEntities.values()) {
+             if (blockEntity instanceof net.minecraft.world.Container) {
+                 // Paper start - this area looks like it can load chunks, change the behavior
+                 // chests for example can apply physics to the world
+                 // so instead we just change the active container and call the event
+-                for (org.bukkit.entity.HumanEntity human : Lists.newArrayList(((net.minecraft.world.Container) blockEntity).getViewers())) {
+-                    ((org.bukkit.craftbukkit.entity.CraftHumanEntity) human).getHandle().closeUnloadedInventory(org.bukkit.event.inventory.InventoryCloseEvent.Reason.UNLOADED); // Paper - Inventory close reason
++                java.util.List<org.bukkit.entity.HumanEntity> viewers = ((net.minecraft.world.Container) blockEntity).getViewers();
++                int viewersSize = viewers.size();
++                if (viewersSize > 0) { // Avoid snapshot allocation when there are no viewers
++                    if (viewersSize == 1) {
++                        org.bukkit.entity.HumanEntity human = viewers.get(0);
++                        ((org.bukkit.craftbukkit.entity.CraftHumanEntity) human).getHandle().closeUnloadedInventory(org.bukkit.event.inventory.InventoryCloseEvent.Reason.UNLOADED);
++                    } else {
++                        for (org.bukkit.entity.HumanEntity human : Lists.newArrayList(viewers)) {
++                            ((org.bukkit.craftbukkit.entity.CraftHumanEntity) human).getHandle().closeUnloadedInventory(org.bukkit.event.inventory.InventoryCloseEvent.Reason.UNLOADED); // Paper - Inventory close reason
++                        }
++                    }
+                 }
+                 // Paper end - this area looks like it can load chunks, change the behavior
+             }
+@@ -1683,6 +1719,11 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+         // Spigot end
+         chunk.clearAllBlockEntities();
+         chunk.unregisterTickContainerFromLevel(this);
++        } finally {
++            if (__unloadStart != 0L) {
++                try { io.multipaper.herculi.instrumentation.HerculiUnloadMetrics.end(__unloadStart); } catch (Throwable ignored) {}
++            }
++        }
+     }
+ 
+     public void removePlayerImmediately(ServerPlayer player, Entity.RemovalReason reason) {
+@@ -1841,23 +1882,13 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+         VoxelShape collisionShape1 = newState.getCollisionShape(this, pos);
+         if (Shapes.joinIsNotEmpty(collisionShape, collisionShape1, BooleanOp.NOT_SAME)) {
+             List<PathNavigation> list = new ObjectArrayList<>();
+-
+-            try { // Paper - catch CME see below why
++            // Herculi: navigatingMobs is concurrent; iterate without CME risk
+             for (Mob mob : this.navigatingMobs) {
+                 PathNavigation navigation = mob.getNavigation();
+                 if (navigation.shouldRecomputePath(pos)) {
+                     list.add(navigation);
+                 }
+             }
+-            // Paper start - catch CME see below why
+-            } catch (final java.util.ConcurrentModificationException concurrentModificationException) {
+-                // This can happen because the pathfinder update below may trigger a chunk load, which in turn may cause more navigators to register
+-                // In this case we just run the update again across all the iterators as the chunk will then be loaded
+-                // As this is a relative edge case it is much faster than copying navigators (on either read or write)
+-                this.sendBlockUpdated(pos, oldState, newState, flags);
+-                return;
+-            }
+-            // Paper end - catch CME see below why
+ 
+             try {
+                 this.isUpdatingNavigations = true;
+diff --git a/net/minecraft/server/network/PlayerChunkSender.java b/net/minecraft/server/network/PlayerChunkSender.java
+index 0376a10ee0544b13e8fd629a7b13f78811e57a30..bd2df7b369362ab20bbd1022d67738e4cd389433 100644
+--- a/net/minecraft/server/network/PlayerChunkSender.java
++++ b/net/minecraft/server/network/PlayerChunkSender.java
+@@ -7,11 +7,14 @@ import it.unimi.dsi.fastutil.longs.LongSet;
+ import java.util.Comparator;
+ import java.util.List;
+ import java.util.Objects;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.atomic.AtomicLong;
+ import net.minecraft.network.protocol.game.ClientboundChunkBatchFinishedPacket;
+ import net.minecraft.network.protocol.game.ClientboundChunkBatchStartPacket;
+ import net.minecraft.network.protocol.game.ClientboundForgetLevelChunkPacket;
+ import net.minecraft.network.protocol.game.ClientboundLevelChunkWithLightPacket;
+ import net.minecraft.network.protocol.game.DebugPackets;
++import net.minecraft.server.MinecraftServer;
+ import net.minecraft.server.level.ChunkMap;
+ import net.minecraft.server.level.ServerLevel;
+ import net.minecraft.server.level.ServerPlayer;
+@@ -33,6 +36,20 @@ public class PlayerChunkSender {
+     private int unacknowledgedBatches;
+     private int maxUnacknowledgedBatches = 1;
+ 
++    // Herculi 0065: Per-tick global packet cache to avoid rebuilding the same chunk packet for multiple recipients.
++    private static volatile int packetCacheTick = Integer.MIN_VALUE;
++    private static final ConcurrentHashMap<Long, ClientboundLevelChunkWithLightPacket> packetCache = new ConcurrentHashMap<>();
++    private static final AtomicLong cacheHits = new AtomicLong();
++    private static final AtomicLong cacheBuilds = new AtomicLong();
++
++    private static void ensurePacketCacheTick() {
++        final int curr = MinecraftServer.currentTick;
++        if (curr != packetCacheTick) {
++            packetCache.clear();
++            packetCacheTick = curr;
++        }
++    }
++
+     public PlayerChunkSender(boolean memoryConnection) {
+         this.memoryConnection = memoryConnection;
+     }
+@@ -81,7 +98,20 @@ public class PlayerChunkSender {
+     // Paper start - Anti-Xray
+     public static void sendChunk(ServerGamePacketListenerImpl packetListener, ServerLevel level, LevelChunk chunk) {
+         final boolean shouldModify = level.chunkPacketBlockController.shouldModify(packetListener.player, chunk);
+-        packetListener.send(new ClientboundLevelChunkWithLightPacket(chunk, level.getLightEngine(), null, null, shouldModify));
++        // Herculi 0065: Cache ClientboundLevelChunkWithLightPacket per tick across recipients. Key: (chunkPos<<1)|modifyFlag
++        ensurePacketCacheTick();
++        final long key = (chunk.getPos().toLong() << 1) | (shouldModify ? 1L : 0L);
++        final ClientboundLevelChunkWithLightPacket existing = packetCache.get(key);
++        final ClientboundLevelChunkWithLightPacket pkt;
++        if (existing != null) {
++            cacheHits.incrementAndGet();
++            pkt = existing;
++        } else {
++            pkt = new ClientboundLevelChunkWithLightPacket(chunk, level.getLightEngine(), null, null, shouldModify);
++            packetCache.put(key, pkt);
++            cacheBuilds.incrementAndGet();
++        }
++        packetListener.send(pkt);
+         // Paper end - Anti-Xray
+         // Paper start - PlayerChunkLoadEvent
+         if (io.papermc.paper.event.packet.PlayerChunkLoadEvent.getHandlerList().getRegisteredListeners().length > 0) {
+@@ -133,4 +163,8 @@ public class PlayerChunkSender {
+     public boolean isPending(long chunkPos) {
+         return this.pendingChunks.contains(chunkPos);
+     }
++
++    // Herculi probe helpers
++    public static long herculi_getCacheHits() { return cacheHits.get(); }
++    public static long herculi_getCacheBuilds() { return cacheBuilds.get(); }
+ }
+diff --git a/net/minecraft/world/level/Level.java b/net/minecraft/world/level/Level.java
+index a0f3795f3aee1541ddab81da3cd8391f0a70e03d..51a99b0bf5ab8f594d0c49412add5ef1641badff 100644
+--- a/net/minecraft/world/level/Level.java
++++ b/net/minecraft/world/level/Level.java
+@@ -74,6 +74,7 @@ import net.minecraft.world.level.material.FluidState;
+ import net.minecraft.world.level.material.Fluids;
+ import net.minecraft.world.level.redstone.CollectingNeighborUpdater;
+ import net.minecraft.world.level.redstone.NeighborUpdater;
++import io.multipaper.herculi.threading.PerThreadNeighborUpdater;
+ import net.minecraft.world.level.redstone.Orientation;
+ import net.minecraft.world.level.saveddata.maps.MapId;
+ import net.minecraft.world.level.saveddata.maps.MapItemSavedData;
+@@ -919,7 +920,7 @@ public abstract class Level implements LevelAccessor, UUIDLookup<Entity>, AutoCl
+         this.thread = Thread.currentThread();
+         this.biomeManager = new BiomeManager(this, biomeZoomSeed);
+         this.isDebug = isDebug;
+-        this.neighborUpdater = new CollectingNeighborUpdater(this, maxChainedNeighborUpdates);
++        this.neighborUpdater = new PerThreadNeighborUpdater(() -> new CollectingNeighborUpdater(this, maxChainedNeighborUpdates));
+         this.registryAccess = registryAccess;
+         this.damageSources = new DamageSources(registryAccess);
+ 
+diff --git a/net/minecraft/world/level/NaturalSpawner.java b/net/minecraft/world/level/NaturalSpawner.java
+index f0f5aa48af099c8244cd59da2c1dac6744a41abe..dccd11c0819845f6a82ecf324e5802f302553431 100644
+--- a/net/minecraft/world/level/NaturalSpawner.java
++++ b/net/minecraft/world/level/NaturalSpawner.java
+@@ -48,6 +48,7 @@ import net.minecraft.world.level.levelgen.structure.structures.NetherFortressStr
+ import net.minecraft.world.level.material.FluidState;
+ import net.minecraft.world.phys.Vec3;
+ import org.slf4j.Logger;
++import io.multipaper.herculi.spawn.CustomSpawnerRegistry;
+ 
+ public final class NaturalSpawner {
+     private static final Logger LOGGER = LogUtils.getLogger();
+@@ -156,6 +157,10 @@ public final class NaturalSpawner {
+         profilerFiller.push("spawner");
+ 
+         for (MobCategory mobCategory : categories) {
++            // Herculi: run custom spawners (default-off if registry empty)
++            if (CustomSpawnerRegistry.instance().hasSpawners()) {
++                try { CustomSpawnerRegistry.instance().spawnForChunk(level, chunk, mobCategory, spawnState); } catch (Throwable ignored) {}
++            }
+             // Paper start - Optional per player mob spawns
+             final boolean canSpawn;
+             int maxSpawns = Integer.MAX_VALUE;
+diff --git a/net/minecraft/world/level/block/EndGatewayBlock.java b/net/minecraft/world/level/block/EndGatewayBlock.java
+index 8e53b45dbf740de6c6fe499ef424d11b2b15f9d8..22c71190648ac272b57095ea46dae529ce445059 100644
+--- a/net/minecraft/world/level/block/EndGatewayBlock.java
++++ b/net/minecraft/world/level/block/EndGatewayBlock.java
+@@ -97,7 +97,19 @@ public class EndGatewayBlock extends BaseEntityBlock implements Portal {
+             && !theEndGatewayBlockEntity.isCoolingDown()) {
+             // Paper start - call EntityPortalEnterEvent
+             org.bukkit.event.entity.EntityPortalEnterEvent event = new org.bukkit.event.entity.EntityPortalEnterEvent(entity.getBukkitEntity(), org.bukkit.craftbukkit.util.CraftLocation.toBukkit(pos, level), org.bukkit.PortalType.END_GATEWAY); // Paper - add portal type
+-            if (!event.callEvent()) return;
++            final net.minecraft.server.MinecraftServer srv = net.minecraft.server.MinecraftServer.getServer();
++            if (srv != null && !srv.isSameThread()) {
++                final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
++                srv.execute(() -> { try { event.callEvent(); } finally { latch.countDown(); } });
++                try { latch.await(); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
++            } else {
++                event.callEvent();
++            }
++            if (!event.isCancelled()) {
++                // continue
++            } else {
++                return;
++            }
+             // Paper end - call EntityPortalEnterEvent
+             // Purpur start - Add EntityTeleportHinderedEvent
+             if (level.purpurConfig.imposeTeleportRestrictionsOnGateways && (entity.isVehicle() || entity.isPassenger())) {
+diff --git a/net/minecraft/world/level/block/NetherPortalBlock.java b/net/minecraft/world/level/block/NetherPortalBlock.java
+index 44707c0bf2c11f7bf7e30f747357ca2a1c6057d6..19296c2ee33c35f3036c210555d5bc8ef0ec6831 100644
+--- a/net/minecraft/world/level/block/NetherPortalBlock.java
++++ b/net/minecraft/world/level/block/NetherPortalBlock.java
+@@ -122,7 +122,14 @@ public class NetherPortalBlock extends Block implements Portal {
+             // Purpur end - Add EntityTeleportHinderedEvent
+             // CraftBukkit start - Entity in portal
+             org.bukkit.event.entity.EntityPortalEnterEvent event = new org.bukkit.event.entity.EntityPortalEnterEvent(entity.getBukkitEntity(), org.bukkit.craftbukkit.util.CraftLocation.toBukkit(pos, level), org.bukkit.PortalType.NETHER); // Paper - add portal type
+-            level.getCraftServer().getPluginManager().callEvent(event);
++            final net.minecraft.server.MinecraftServer srv = net.minecraft.server.MinecraftServer.getServer();
++            if (srv != null && !srv.isSameThread()) {
++                final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
++                srv.execute(() -> { try { level.getCraftServer().getPluginManager().callEvent(event); } finally { latch.countDown(); } });
++                try { latch.await(); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
++            } else {
++                level.getCraftServer().getPluginManager().callEvent(event);
++            }
+             if (event.isCancelled()) return; // Paper - make cancellable
+             // CraftBukkit end
+             entity.setAsInsidePortal(this, pos);
+@@ -152,7 +159,17 @@ public class NetherPortalBlock extends Block implements Portal {
+         ServerLevel level1 = level.getServer().getLevel(resourceKey);
+         // Paper start - Add EntityPortalReadyEvent
+         io.papermc.paper.event.entity.EntityPortalReadyEvent portalReadyEvent = new io.papermc.paper.event.entity.EntityPortalReadyEvent(entity.getBukkitEntity(), level1 == null ? null : level1.getWorld(), org.bukkit.PortalType.NETHER);
+-        if (!portalReadyEvent.callEvent()) {
++        final net.minecraft.server.MinecraftServer srvEvt = net.minecraft.server.MinecraftServer.getServer();
++        if (srvEvt != null && !srvEvt.isSameThread()) {
++            final java.util.concurrent.atomic.AtomicBoolean allowed = new java.util.concurrent.atomic.AtomicBoolean(true);
++            final java.util.concurrent.CountDownLatch latchEvt = new java.util.concurrent.CountDownLatch(1);
++            srvEvt.execute(() -> { try { if (!portalReadyEvent.callEvent()) allowed.set(false); } finally { latchEvt.countDown(); } });
++            try { latchEvt.await(); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
++            if (!allowed.get()) {
++                entity.portalProcess = null;
++                return null;
++            }
++        } else if (!portalReadyEvent.callEvent()) {
+             entity.portalProcess = null;
+             return null;
+         }
+diff --git a/net/minecraft/world/level/chunk/ChunkGenerator.java b/net/minecraft/world/level/chunk/ChunkGenerator.java
+index 854578c7880dc124980142941ee471072668c8e2..896f3c5ba508428747f9e45896e9bbf80c79aaec 100644
+--- a/net/minecraft/world/level/chunk/ChunkGenerator.java
++++ b/net/minecraft/world/level/chunk/ChunkGenerator.java
+@@ -359,6 +359,7 @@ public abstract class ChunkGenerator {
+                 Registry<PlacedFeature> registry1 = level.registryAccess().lookupOrThrow(Registries.PLACED_FEATURE);
+                 int max = Math.max(GenerationStep.Decoration.values().length, size);
+ 
++                final it.unimi.dsi.fastutil.ints.IntArraySet __featureIndexSet = new it.unimi.dsi.fastutil.ints.IntArraySet(); // Herculi: reuse per-iteration set
+                 for (int i = 0; i < max; i++) {
+                     int i1 = 0;
+                     if (structureManager.shouldGenerateStructures()) {
+@@ -385,14 +386,17 @@ public abstract class ChunkGenerator {
+                     }
+ 
+                     if (i < size) {
+-                        IntSet set1 = new IntArraySet();
++                        IntSet set1 = __featureIndexSet; set1.clear(); // Herculi: reuse per-iteration set instead of allocating
+ 
+                         for (Holder<Biome> holder : set) {
+                             List<HolderSet<PlacedFeature>> list2 = this.generationSettingsGetter.apply(holder).features();
+                             if (i < list2.size()) {
+                                 HolderSet<PlacedFeature> holderSet = list2.get(i);
+                                 FeatureSorter.StepFeatureData stepFeatureData = list.get(i);
+-                                holderSet.stream().map(Holder::value).forEach(feature -> set1.add(stepFeatureData.indexMapping().applyAsInt(feature)));
++                                for (Holder<PlacedFeature> pf : holderSet) {
++                                    PlacedFeature feature = pf.value();
++                                    set1.add(stepFeatureData.indexMapping().applyAsInt(feature));
++                                }
+                             }
+                         }
+ 
+diff --git a/net/minecraft/world/level/chunk/LevelChunk.java b/net/minecraft/world/level/chunk/LevelChunk.java
+index 75578e6ed7233a03d9b6cd3c6d3997f1c6148392..32cab9fcd78e24649d863637fda7dbb8f11b953b 100644
+--- a/net/minecraft/world/level/chunk/LevelChunk.java
++++ b/net/minecraft/world/level/chunk/LevelChunk.java
+@@ -926,7 +926,18 @@ public class LevelChunk extends ChunkAccess implements ca.spottedleaf.moonrise.p
+                         profilerFiller.push(this::getType);
+                         BlockState blockState = LevelChunk.this.getBlockState(blockPos);
+                         if (this.blockEntity.getType().isValid(blockState)) {
+-                            this.ticker.tick(LevelChunk.this.level, this.blockEntity.getBlockPos(), blockState, this.blockEntity);
++                            // Herculi: optional block entity tick timing (gated)
++                            long __beStart = 0L;
++                            if (io.multipaper.herculi.config.HerculiConfig.instance().instrumentationBlockEntityMetricsEnabled()) {
++                                try { __beStart = io.multipaper.herculi.instrumentation.HerculiBlockEntityMetrics.start(); } catch (Throwable ignored) {}
++                            }
++                            try {
++                                this.ticker.tick(LevelChunk.this.level, this.blockEntity.getBlockPos(), blockState, this.blockEntity);
++                            } finally {
++                                if (__beStart != 0L) {
++                                    try { io.multipaper.herculi.instrumentation.HerculiBlockEntityMetrics.end(__beStart); } catch (Throwable ignored) {}
++                                }
++                            }
+                             this.loggedInvalidBlockState = false;
+                         // Paper start - Remove the Block Entity if it's invalid
+                         } else {
+diff --git a/net/minecraft/world/level/entity/EntityLookup.java b/net/minecraft/world/level/entity/EntityLookup.java
+index 6b1bec0329cdc95eff00850c67d7f33bd9037285..3f1de53b774a0a9ff49c4a743b2d94486e31dbdf 100644
+--- a/net/minecraft/world/level/entity/EntityLookup.java
++++ b/net/minecraft/world/level/entity/EntityLookup.java
+@@ -15,54 +15,74 @@ public class EntityLookup<T extends EntityAccess> {
+     private static final Logger LOGGER = LogUtils.getLogger();
+     private final Int2ObjectMap<T> byId = new Int2ObjectLinkedOpenHashMap<>();
+     private final Map<UUID, T> byUuid = Maps.newHashMap();
++    // Herculi: thread-safety guard for entity maps (Task 27)
++    private final Object entityMapLock = new Object();
+ 
+     public <U extends T> void getEntities(EntityTypeTest<T, U> test, AbortableIterationConsumer<U> consumer) {
+-        for (T entityAccess : this.byId.values()) {
+-            U entityAccess1 = (U)test.tryCast(entityAccess);
+-            if (entityAccess1 != null && consumer.accept(entityAccess1).shouldAbort()) {
+-                return;
++        // Iterate under lock to avoid CME and ensure consistent view
++        synchronized (this.entityMapLock) {
++            for (T entityAccess : this.byId.values()) {
++                U entityAccess1 = (U)test.tryCast(entityAccess);
++                if (entityAccess1 != null && consumer.accept(entityAccess1).shouldAbort()) {
++                    return;
++                }
+             }
+         }
+     }
+ 
+     public Iterable<T> getAllEntities() {
+-        return Iterables.unmodifiableIterable(this.byId.values());
++        // Return a snapshot to avoid exposing live mutable views
++        synchronized (this.entityMapLock) {
++            java.util.ArrayList<T> copy = new java.util.ArrayList<>(this.byId.size());
++            for (T v : this.byId.values()) copy.add(v);
++            return java.util.Collections.unmodifiableList(copy);
++        }
+     }
+ 
+     public void add(T entity) {
+-        UUID uuid = entity.getUUID();
+-        if (this.byUuid.containsKey(uuid)) {
+-            LOGGER.warn("Duplicate entity UUID {}: {}", uuid, entity);
+-            // Paper start - extra debug info
+-            if (entity instanceof net.minecraft.world.entity.Entity) {
+-                final T old = this.byUuid.get(entity.getUUID());
+-                if (old instanceof net.minecraft.world.entity.Entity oldCast && oldCast.getId() != entity.getId() && oldCast.valid) {
+-                    LOGGER.error("Overwrote an existing entity {} with {}", oldCast, entity);
++        synchronized (this.entityMapLock) {
++            UUID uuid = entity.getUUID();
++            if (this.byUuid.containsKey(uuid)) {
++                LOGGER.warn("Duplicate entity UUID {}: {}", uuid, entity);
++                // Paper start - extra debug info
++                if (entity instanceof net.minecraft.world.entity.Entity) {
++                    final T old = this.byUuid.get(entity.getUUID());
++                    if (old instanceof net.minecraft.world.entity.Entity oldCast && oldCast.getId() != entity.getId() && oldCast.valid) {
++                        LOGGER.error("Overwrote an existing entity {} with {}", oldCast, entity);
++                    }
+                 }
++                // Paper end - extra debug info
++            } else {
++                this.byUuid.put(uuid, entity);
++                this.byId.put(entity.getId(), entity);
+             }
+-            // Paper end - extra debug info
+-        } else {
+-            this.byUuid.put(uuid, entity);
+-            this.byId.put(entity.getId(), entity);
+         }
+     }
+ 
+     public void remove(T entity) {
+-        this.byUuid.remove(entity.getUUID());
+-        this.byId.remove(entity.getId());
++        synchronized (this.entityMapLock) {
++            this.byUuid.remove(entity.getUUID());
++            this.byId.remove(entity.getId());
++        }
+     }
+ 
+     @Nullable
+     public T getEntity(int id) {
+-        return this.byId.get(id);
++        synchronized (this.entityMapLock) {
++            return this.byId.get(id);
++        }
+     }
+ 
+     @Nullable
+     public T getEntity(UUID uuid) {
+-        return this.byUuid.get(uuid);
++        synchronized (this.entityMapLock) {
++            return this.byUuid.get(uuid);
++        }
+     }
+ 
+     public int count() {
+-        return this.byUuid.size();
++        synchronized (this.entityMapLock) {
++            return this.byUuid.size();
++        }
+     }
+ }
+diff --git a/net/minecraft/world/level/levelgen/LegacyRandomSource.java b/net/minecraft/world/level/levelgen/LegacyRandomSource.java
+index c67168517774a0ad9ca43422a79ef14a8ea0c2e8..41196305dfb282d7a666a2ab01db9c90193bfe94 100644
+--- a/net/minecraft/world/level/levelgen/LegacyRandomSource.java
++++ b/net/minecraft/world/level/levelgen/LegacyRandomSource.java
+@@ -30,22 +30,21 @@ public class LegacyRandomSource implements BitRandomSource {
+ 
+     @Override
+     public void setSeed(long seed) {
+-        if (!this.seed.compareAndSet(this.seed.get(), (seed ^ 25214903917L) & 281474976710655L)) {
+-            throw ThreadingDetector.makeThreadingException("LegacyRandomSource", null);
+-        } else {
+-            this.gaussianSource.reset();
+-        }
++        // Herculi: thread-safe behavior (ShreddedPaper approach)
++        // We don't strictly enforce single-threaded access; set atomically and reset gaussian.
++        this.seed.set((seed ^ 25214903917L) & 281474976710655L);
++        this.gaussianSource.reset();
+     }
+ 
+     @Override
+     public int next(int size) {
+-        long l = this.seed.get();
+-        long l1 = l * 25214903917L + 11L & 281474976710655L;
+-        if (!this.seed.compareAndSet(l, l1)) {
+-            throw ThreadingDetector.makeThreadingException("LegacyRandomSource", null);
+-        } else {
+-            return (int)(l1 >> 48 - size);
+-        }
++        // Herculi: thread-safe next (ShreddedPaper approach)
++        long oldseed, nextseed;
++        do {
++            oldseed = this.seed.get();
++            nextseed = oldseed * 25214903917L + 11L & 281474976710655L;
++        } while (!this.seed.compareAndSet(oldseed, nextseed));
++        return (int)(nextseed >> 48 - size);
+     }
+ 
+     @Override
+diff --git a/net/minecraft/world/scores/PlayerTeam.java b/net/minecraft/world/scores/PlayerTeam.java
+index 4398151f8daff7617111cf5361e9df4111d4aca4..2d554fda1da03007e3756f25b1b7f9c33a764f3c 100644
+--- a/net/minecraft/world/scores/PlayerTeam.java
++++ b/net/minecraft/world/scores/PlayerTeam.java
+@@ -22,7 +22,7 @@ public class PlayerTeam extends Team {
+     private static final int BIT_SEE_INVISIBLES = 1;
+     private final Scoreboard scoreboard;
+     private final String name;
+-    private final Set<String> players = Sets.newHashSet();
++    private final java.util.Set<String> players = java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<String, Boolean>()); // Herculi - thread-safe
+     private Component displayName;
+     private Component playerPrefix = CommonComponents.EMPTY;
+     private Component playerSuffix = CommonComponents.EMPTY;
+diff --git a/net/minecraft/world/scores/Scoreboard.java b/net/minecraft/world/scores/Scoreboard.java
+index 4275d048a8f5e98c7436f5bf2d55a9b68f7ba818..91e5d1ed660d98eec7c2c5294f1668b065b7463c 100644
+--- a/net/minecraft/world/scores/Scoreboard.java
++++ b/net/minecraft/world/scores/Scoreboard.java
+@@ -30,9 +30,9 @@ import org.slf4j.Logger;
+ public class Scoreboard {
+     public static final String HIDDEN_SCORE_PREFIX = "#";
+     private static final Logger LOGGER = LogUtils.getLogger();
+-    private final Object2ObjectMap<String, Objective> objectivesByName = new Object2ObjectOpenHashMap<>(16, 0.5F);
+-    private final Reference2ObjectMap<ObjectiveCriteria, List<Objective>> objectivesByCriteria = new Reference2ObjectOpenHashMap<>();
+-    private final Map<String, PlayerScores> playerScores = new Object2ObjectOpenHashMap<>(16, 0.5F);
++    private final java.util.Map<String, Objective> objectivesByName = new java.util.concurrent.ConcurrentHashMap<>(); // Herculi - thread-safe
++    private final java.util.concurrent.ConcurrentMap<ObjectiveCriteria, java.util.List<Objective>> objectivesByCriteria = new java.util.concurrent.ConcurrentHashMap<>(); // Herculi - thread-safe
++    private final java.util.Map<String, PlayerScores> playerScores = new java.util.concurrent.ConcurrentHashMap<>(); // Herculi - thread-safe
+     private final Map<DisplaySlot, Objective> displayObjectives = new EnumMap<>(DisplaySlot.class);
+     private final Object2ObjectMap<String, PlayerTeam> teamsByName = new Object2ObjectOpenHashMap<>();
+     private final Object2ObjectMap<String, PlayerTeam> teamsByPlayer = new Object2ObjectOpenHashMap<>();
+@@ -54,7 +54,7 @@ public class Scoreboard {
+             throw new IllegalArgumentException("An objective with the name '" + name + "' already exists!");
+         } else {
+             Objective objective = new Objective(this, name, criteria, displayName, renderType, displayAutoUpdate, numberFormat);
+-            this.objectivesByCriteria.computeIfAbsent(criteria, object -> Lists.newArrayList()).add(objective);
++            this.objectivesByCriteria.computeIfAbsent(criteria, k -> new java.util.concurrent.CopyOnWriteArrayList<>()).add(objective); // Herculi - thread-safe list
+             this.objectivesByName.put(name, objective);
+             this.onObjectiveAdded(objective);
+             return objective;
