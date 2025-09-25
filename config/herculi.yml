@@ -1,36 +1,71 @@
-# Herculi configuration
+# Herculi configuration - Optimized for 1000+ players
 # Minimal key: value format. Unknown keys are ignored.
+# This configuration is optimized for high player count servers (1000+ players)
+# while preserving vanilla-like gameplay experience and maintaining 20 TPS
 
-# Threading and regionization
-threading.enabled: false
-threading.region_pool_size: 0 # 0 or missing = auto (CPU count)
-threading.region_shift: 4      # power-of-two region size in chunks (default 4 => 16x16 chunks per region)
+# Threading and regionization - ENABLED for performance
+threading.enabled: true
+threading.region_pool_size: 0 # 0 = auto (CPU count) - recommended for optimal performance
+threading.region_shift: 4      # 16x16 chunks per region - good balance for player distribution
 
-# Async chunk I/O pipeline
-threading.chunk_io_enable: false
-threading.chunk_io_max_inflight: 16
+# Async chunk I/O pipeline - ENABLED for better I/O performance
+threading.chunk_io_enable: true
+threading.chunk_io_max_inflight: 32  # Increased for higher throughput
 
-# Networking options
-networking.parallel_flush_enabled: false
+# Networking options - ENABLED for better network performance
+networking.parallel_flush_enabled: true
+networking.ping.defer.enabled: true
+networking.ping.defer.ticks: 1
 
-# Threaded broadcasting (default-off)
-broadcasting.threaded.enabled: false
+# Threaded broadcasting - ENABLED for packet performance with 1000+ players
+broadcasting.threaded.enabled: true
 broadcasting.threaded.perRecipientQueues: true
-broadcasting.threaded.maxQueuesTotal: 20000
-broadcasting.threaded.maxQueuesPerPlayer: 512
-broadcasting.threaded.maxBatchesPerQueue: 64
-broadcasting.threaded.dropPolicy: coalesce
-broadcasting.threaded.drainIntervalMs: 2
+broadcasting.threaded.maxQueuesTotal: 50000  # Increased for 1000+ players
+broadcasting.threaded.maxQueuesPerPlayer: 1024  # Higher limit per player
+broadcasting.threaded.maxBatchesPerQueue: 128   # Larger batches for efficiency
+broadcasting.threaded.dropPolicy: coalesce      # Coalesce for performance
+broadcasting.threaded.drainIntervalMs: 1        # More frequent draining
+broadcasting.threaded.drainBudget: 256          # Higher budget for throughput
 
-# Portals/teleportation routing
-portals.routing_enabled: false
+# Portals/teleportation routing - ENABLED for async teleports
+portals.routing_enabled: true
 
-# Profiling/diagnostics
-profiling.enabled: false
+# Profiling/diagnostics - ENABLED for monitoring
+profiling.enabled: true
 
-# Handoff (default-off). When enabled, certain non-critical emissions may be marshalled safely.
-threading.handoff.enabled: false           # master switch
-threading.handoff.sounds: false            # handoff playSound() calls to main thread
-threading.handoff.particles: false         # handoff spawnParticle() calls to main thread
-threading.handoff.tracker_packets: false   # emit certain tracker packets via region scheduler for ordering
-threading.handoff.debug: false             # debug logging for handoffs
+# Guardrails - ENABLED for safety in production
+guardrails.enabled: true
+guardrails.networking.logOffThread: false  # Disable noisy logs in production
+
+# Handoff optimizations - ENABLED for performance
+threading.handoff.enabled: true            # master switch - ENABLED
+threading.handoff.sounds: true             # handoff playSound() calls - reduces main thread load
+threading.handoff.particles: true          # handoff spawnParticle() calls - reduces main thread load
+threading.handoff.tracker_packets: true    # emit tracker packets via region scheduler
+threading.handoff.debug: false             # keep debug off in production
+
+# Fairness system - ENABLED for balanced resource allocation
+fairness.enabled: true
+fairness.broadcast_drain_budget: 512        # Higher budget for 1000+ players
+fairness.region_task_budget: 256            # Balanced region task processing
+
+# Entity optimizations - ENABLED for better entity performance
+entities.tracking.cap_enabled: true         # Enable tracking caps
+entities.tracking.max_per_player: 512       # Reasonable limit per player
+
+# Block entity optimizations - ENABLED for better tile entity performance
+block_entities.metrics_enabled: true        # Monitor block entity performance
+block_entities.tick_budget: 1000            # Microsecond budget per tick
+
+# Player save optimizations - ENABLED for async saves
+player_saves.async_enabled: true            # Async player saves
+player_saves.batch_size: 16                 # Batch multiple saves
+
+# Chunk optimizations
+chunks.unload_metrics_enabled: true         # Monitor chunk unload performance
+chunks.precompute_enabled: true             # Enable random precomputation
+
+# Network optimizations for high player count
+networking.lazy_writes_enabled: true        # Reduce network overhead
+networking.flush_merging_enabled: true      # Merge network flushes
+networking.packet_caching_enabled: true     # Cache common packets

@@ -54,3 +54,8 @@ HerculiPaper — Tasks Completed
   - BroadcastManager (gated) + CraftPlayer routing for section block updates; per-recipient queues with immediate budgeted drain.
   - Metrics exposed via /herculi probe: bq.enqueued, bq.drained, bq.queues.
   - Config keys: broadcasting.threaded.enabled, broadcasting.threaded.maxBatchesPerQueue.
+
+- 0067-BroadcastPacketEvent.patch — DONE
+  - Main-thread drain loop wired via PlayerList.tick() calling BroadcastRegistry.drainOnMainTick(server) with per-tick budget.
+  - Queue metrics enhanced: enq/deq rates (per second) and drain budget surfaced in /herculi queues.
+  - Recipient queue manager sends batches directly to each player's connection; queues cleaned lazily when recipients disappear.

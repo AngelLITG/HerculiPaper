@@ -1,0 +1,851 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Angel <achaparro@lifeisthegame.email>
+Date: Wed, 24 Sep 2025 20:07:54 -0500
+Subject: [PATCH] Herculi Stable
+
+
+diff --git a/src/main/java/io/multipaper/herculi/broadcast/BroadcastRegistry.java b/src/main/java/io/multipaper/herculi/broadcast/BroadcastRegistry.java
+index 93f3e76e3d50a60d9032b0d9ba20e19b6e926b7f..7a6eabfe6e31075224a0459b510b33d7fae81439 100644
+--- a/src/main/java/io/multipaper/herculi/broadcast/BroadcastRegistry.java
++++ b/src/main/java/io/multipaper/herculi/broadcast/BroadcastRegistry.java
+@@ -30,4 +30,29 @@ public final class BroadcastRegistry {
+ 
+     public static boolean enabled() { return enabled; }
+     public static int drainBudget() { return drainBudget; }
++
++    /**
++     * Drain queued broadcast batches on the main thread.
++     * This should be invoked once per tick from the server loop.
++     */
++    public static int drainOnMainTick(final net.minecraft.server.MinecraftServer server) {
++        if (!enabled()) return 0;
++        final var list = server.getPlayerList();
++        return manager().drainOnMain((key, batch) -> {
++            try {
++                if (key == null || batch == null) return Boolean.FALSE;
++                final net.minecraft.server.level.ServerPlayer player = list.getPlayer(key.playerUuid);
++                if (player == null || player.connection == null) {
++                    // recipient gone, remove queue lazily
++                    return Boolean.FALSE;
++                }
++                for (net.minecraft.network.protocol.Packet<?> pkt : batch.packets) {
++                    if (pkt != null) player.connection.send(pkt);
++                }
++                return Boolean.TRUE;
++            } catch (Throwable ignored) {
++                return Boolean.FALSE;
++            }
++        }, drainBudget());
++    }
+ }
+diff --git a/src/main/java/io/multipaper/herculi/concurrent/WeakSeqLock.java b/src/main/java/io/multipaper/herculi/concurrent/WeakSeqLock.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..304f5ec0f458039e656aeb63c111cb89bc1e5a33
+--- /dev/null
++++ b/src/main/java/io/multipaper/herculi/concurrent/WeakSeqLock.java
+@@ -0,0 +1,71 @@
++package io.multipaper.herculi.concurrent;
++
++import java.lang.invoke.MethodHandles;
++import java.lang.invoke.VarHandle;
++
++/**
++ * Weak seqlock for multi-writer/multi-reader scenarios where readers can tolerate
++ * occasional retries and writers are rare/short. Writers increment a version before
++ * and after the critical section. Readers snapshot data while the version is even
++ * and retry if version changed to ensure a consistent view without locking.
++ *
++ * This is a weak seqlock: it does not block writers or readers, and should only
++ * be used for protecting small, quickly-copied snapshots.
++ */
++public final class WeakSeqLock {
++    private volatile int version; // even == stable, odd == writer in progress
++
++    private static final VarHandle VERSION_HANDLE;
++    static {
++        try {
++            VERSION_HANDLE = MethodHandles.lookup().findVarHandle(WeakSeqLock.class, "version", int.class);
++        } catch (ReflectiveOperationException e) {
++            throw new ExceptionInInitializerError(e);
++        }
++    }
++
++    public WeakSeqLock() {
++        this.version = 0;
++    }
++
++    /**
++     * Begin a write section. Multiple nested begin/end on same thread are allowed but discouraged.
++     */
++    public void beginWrite() {
++        // increment to odd using release semantics
++        int v = (int) VERSION_HANDLE.getAcquire(this);
++        VERSION_HANDLE.setRelease(this, v + 1);
++    }
++
++    /**
++     * End a write section.
++     */
++    public void endWrite() {
++        int v = (int) VERSION_HANDLE.getAcquire(this);
++        VERSION_HANDLE.setRelease(this, v + 1);
++    }
++
++    /**
++     * Returns a stamp to validate a read snapshot. Only valid if even.
++     */
++    public int tryReadBegin() {
++        int v;
++        // acquire to observe prior writes
++        do {
++            v = (int) VERSION_HANDLE.getAcquire(this);
++            if ((v & 1) == 0) {
++                return v;
++            }
++            // writer in progress, spin briefly
++        } while ((v & 1) != 0);
++        return v;
++    }
++
++    /**
++     * Returns true if the passed stamp is still valid (no writer intervened).
++     */
++    public boolean tryReadValidate(int stamp) {
++        // load acquire to see writer's endWrite
++        return stamp == (int) VERSION_HANDLE.getAcquire(this) && (stamp & 1) == 0;
++    }
++}
+diff --git a/src/main/java/io/multipaper/herculi/config/HerculiConfig.java b/src/main/java/io/multipaper/herculi/config/HerculiConfig.java
+index c1a253f2418bbeb8ea7c265863a4c738966f5353..73bca658b72222fc1d411b0bd12c02fc539b86f1 100644
+--- a/src/main/java/io/multipaper/herculi/config/HerculiConfig.java
++++ b/src/main/java/io/multipaper/herculi/config/HerculiConfig.java
+@@ -41,7 +41,16 @@ public final class HerculiConfig {
+     public boolean instrumentationUnloadMetricsEnabled() { return getBoolean("instrumentation.unload.metrics_enabled", false); }
+     public boolean instrumentationBlockEntityMetricsEnabled() { return getBoolean("instrumentation.block_entities.metrics_enabled", false); }
+     public int threadingRegionPoolSize() { return Math.max(0, getInt("threading.region_pool_size", 0)); }
+-    public int threadingRegionShift() { return Math.max(0, getInt("threading.region_shift", 4)); }
++    // Cache frequently accessed values to avoid hot path parsing
++    private volatile int cachedRegionShift = -1;
++    public int threadingRegionShift() { 
++        int cached = this.cachedRegionShift;
++        if (cached == -1) {
++            cached = Math.max(0, getInt("threading.region_shift", 4));
++            this.cachedRegionShift = cached;
++        }
++        return cached;
++    }
+     public int threadingRegionExecutorIdleMinutes() { return Math.max(1, getInt("threading.region_executor_idle_minutes", 10)); }
+     public int threadingRegionExecutorCleanupEveryEnqueues() { return Math.max(10, getInt("threading.region_executor_cleanup_check_enqueues", 200)); }
+     public boolean chunkIoEnabled() { return getBoolean("threading.chunk_io_enable", false); }
+@@ -50,6 +59,7 @@ public final class HerculiConfig {
+     public void reload() {
+         this.loaded = false;
+         this.values.clear();
++        this.cachedRegionShift = -1; // Reset cache
+         ensureLoaded();
+     }
+ 
+@@ -112,8 +122,39 @@ public final class HerculiConfig {
+                             + "threading.chunk_io_max_inflight: 16\n\n"
+                             + "# Networking options\n"
+                             + "networking.parallel_flush_enabled: false\n"
++                            + "networking.write.lazyExecute.enabled: false\n"
+                             + "networking.fencing.enabled: false\n"
+                             + "networking.fencing.debug: false\n\n"
++                            + "networking.ping.defer.enabled: false\n"
++                            + "networking.ping.defer.ticks: 1\n\n"
++                            + "# Async player save I/O\n"
++                            + "async.player_save.enabled: false\n"
++                            + "async.player_save.pool_size: 1\n\n"
++                            + "# Entity activation optimizations\n"
++                            + "activation.check_immunities_interval: 20\n\n"
++                            + "# Redstone optimizations\n"
++                            + "redstone.ac.enabled: false\n"
++                            + "redstone.wire.turbo.enabled: false\n"
++                            + "redstone.threadsafe_neighbors.enabled: false\n\n"
++                            + "# Potential calculator optimization\n"
++                            + "potential.cache.enabled: false\n"
++                            + "potential.cache.size: 4096\n\n"
++                            + "# World init sequencing\n"
++                            + "world.init.attach_global_scheduler.enabled: true\n"
++                            + "world.init.attach_global_scheduler.log: true\n\n"
++                            + "# Fireworks cleanup on owner detach/teleport\n"
++                            + "fireworks.cleanup.on_owner_removed: true\n"
++                            + "fireworks.cleanup.on_world_mismatch: true\n\n"
++                            + "# Region guards\n"
++                            + "regions.boundary.enforce.enabled: false\n"
++                            + "regions.boundary.log: true\n"
++                            + "regions.actions.same_region_only.enabled: true\n"
++                            + "regions.actions.same_region_only.log: false\n\n"
++                            + "# Entity tracker caps\n"
++                            + "entities.tracker.max_per_entity: 512\n"
++                            + "entities.tracker.cap.log: true\n\n"
++                            + "# Vanish optimization\n"
++                            + "entities.tracker.vanish.cache.enabled: true\n\n"
+                             + "# Portals/teleportation routing\n"
+                             + "portals.routing_enabled: false\n\n"
+                             + "# Profiling/diagnostics\n"
+@@ -214,8 +255,30 @@ public final class HerculiConfig {
+         m.put("threading.chunk_io_enable", "false");
+         m.put("threading.chunk_io_max_inflight", "16");
+         m.put("networking.parallel_flush_enabled", "false");
++        m.put("networking.write.lazyExecute.enabled", "false");
+         m.put("networking.fencing.enabled", "false");
+         m.put("networking.fencing.debug", "false");
++        m.put("networking.ping.defer.enabled", "false");
++        m.put("networking.ping.defer.ticks", "1");
++        m.put("async.player_save.enabled", "false");
++        m.put("async.player_save.pool_size", "1");
++        m.put("activation.check_immunities_interval", "20");
++        m.put("redstone.ac.enabled", "false");
++        m.put("redstone.wire.turbo.enabled", "false");
++        m.put("redstone.threadsafe_neighbors.enabled", "false");
++        m.put("potential.cache.enabled", "false");
++        m.put("potential.cache.size", "4096");
++        m.put("world.init.attach_global_scheduler.enabled", "true");
++        m.put("world.init.attach_global_scheduler.log", "true");
++        m.put("fireworks.cleanup.on_owner_removed", "true");
++        m.put("fireworks.cleanup.on_world_mismatch", "true");
++        m.put("regions.boundary.enforce.enabled", "false");
++        m.put("regions.boundary.log", "true");
++        m.put("regions.actions.same_region_only.enabled", "true");
++        m.put("regions.actions.same_region_only.log", "false");
++        m.put("entities.tracker.max_per_entity", "512");
++        m.put("entities.tracker.cap.log", "true");
++        m.put("entities.tracker.vanish.cache.enabled", "true");
+         m.put("portals.routing_enabled", "false");
+         m.put("profiling.enabled", "false");
+         m.put("commands.marshalPerTarget", "false");
+diff --git a/src/main/java/io/multipaper/herculi/instrumentation/HerculiInstrumentation.java b/src/main/java/io/multipaper/herculi/instrumentation/HerculiInstrumentation.java
+index 9d8551f0263ff5628e7508c8316b684f766cdd64..8b92c612d6762af572e041b7eaf05f8500208d30 100644
+--- a/src/main/java/io/multipaper/herculi/instrumentation/HerculiInstrumentation.java
++++ b/src/main/java/io/multipaper/herculi/instrumentation/HerculiInstrumentation.java
+@@ -14,6 +14,9 @@ public final class HerculiInstrumentation {
+     private final java.util.concurrent.atomic.AtomicLong regionPoolsCreated = new java.util.concurrent.atomic.AtomicLong();
+     private final java.util.concurrent.atomic.AtomicLong regionTasksEnqueued = new java.util.concurrent.atomic.AtomicLong();
+     private final java.util.concurrent.atomic.AtomicLong regionTasksExecuted = new java.util.concurrent.atomic.AtomicLong();
++    private final java.util.concurrent.atomic.AtomicLong regionBoundaryCrossings = new java.util.concurrent.atomic.AtomicLong();
++    private final java.util.concurrent.atomic.AtomicLong regionBoundaryClamped = new java.util.concurrent.atomic.AtomicLong();
++    private final java.util.concurrent.atomic.AtomicLong redstoneCrossRegionSkipped = new java.util.concurrent.atomic.AtomicLong();
+ 
+     private HerculiInstrumentation() {}
+ 
+@@ -21,9 +24,15 @@ public final class HerculiInstrumentation {
+     public void incRegionPoolCreated() { regionPoolsCreated.incrementAndGet(); }
+     public void incRegionTasksEnqueued() { regionTasksEnqueued.incrementAndGet(); }
+     public void incRegionTasksExecuted() { regionTasksExecuted.incrementAndGet(); }
++    public void incRegionBoundaryCrossings() { regionBoundaryCrossings.incrementAndGet(); }
++    public void incRegionBoundaryClamped() { regionBoundaryClamped.incrementAndGet(); }
++    public void incRedstoneCrossRegionSkipped() { redstoneCrossRegionSkipped.incrementAndGet(); }
+ 
+     // Snapshots
+     public long regionPoolsCreated() { return regionPoolsCreated.get(); }
+     public long regionTasksEnqueued() { return regionTasksEnqueued.get(); }
+     public long regionTasksExecuted() { return regionTasksExecuted.get(); }
++    public long regionBoundaryCrossings() { return regionBoundaryCrossings.get(); }
++    public long regionBoundaryClamped() { return regionBoundaryClamped.get(); }
++    public long redstoneCrossRegionSkipped() { return redstoneCrossRegionSkipped.get(); }
+ }
+diff --git a/src/main/java/io/multipaper/herculi/instrumentation/HerculiQueues.java b/src/main/java/io/multipaper/herculi/instrumentation/HerculiQueues.java
+index 3f1046974cde336dd3a2939b18c1b687771ddc58..d5734c7a4371a98dcc08eb966bbe067f3cdedd6d 100644
+--- a/src/main/java/io/multipaper/herculi/instrumentation/HerculiQueues.java
++++ b/src/main/java/io/multipaper/herculi/instrumentation/HerculiQueues.java
+@@ -13,6 +13,11 @@ public final class HerculiQueues {
+     public static HerculiQueues instance() { return INSTANCE; }
+     private HerculiQueues() {}
+ 
++    // simple rate computation state
++    private static volatile long lastSnapshotTimeMillis = 0L;
++    private static volatile long lastEnq = 0L;
++    private static volatile long lastDeq = 0L;
++
+     public String snapshot() {
+         HerculiInstrumentation inst = HerculiInstrumentation.instance();
+         long pools = inst.regionPoolsCreated();
+@@ -20,6 +25,25 @@ public final class HerculiQueues {
+         long exe = inst.regionTasksExecuted();
+         long inFlight = Math.max(0, enq - exe);
+         int active = RegionSchedulers.activeExecutorCount();
++        // Rate calc
++        long now = System.currentTimeMillis();
++        long prevTime = lastSnapshotTimeMillis;
++        long deltaMs = now - prevTime;
++        long enqBatches = 0, deqBatches = 0;
++        long enqRate = 0, deqRate = 0;
++        try {
++            enqBatches = BroadcastMetrics.getEnqueuedBatches();
++            deqBatches = BroadcastMetrics.getDequeuedBatches();
++            if (prevTime != 0L && deltaMs > 0L) {
++                long dEnq = Math.max(0, enqBatches - lastEnq);
++                long dDeq = Math.max(0, deqBatches - lastDeq);
++                enqRate = (dEnq * 1000L) / deltaMs;
++                deqRate = (dDeq * 1000L) / deltaMs;
++            }
++        } catch (Throwable ignored) {}
++        lastSnapshotTimeMillis = now;
++        lastEnq = enqBatches;
++        lastDeq = deqBatches;
+         // Level probes
+         String levelProbe = "";
+         try {
+@@ -40,12 +64,16 @@ public final class HerculiQueues {
+             final long deqB = BroadcastMetrics.getDequeuedBatches();
+             final long dropOv = BroadcastMetrics.getDroppedBatchesOverflow();
+             final long dropTo = BroadcastMetrics.getDroppedBatchesTimeout();
++            final int drainBudget = BroadcastRegistry.drainBudget();
+             broadcast = ", broadcast.enabled=" + bcEnabled
+                 + ", broadcast.managerSize=" + qMgrSize
+                 + ", broadcast.pendingBatches=" + qPending
+                 + ", broadcast.activeQueues=" + qActive
+                 + ", broadcast.enqueuedBatches=" + enqB
+                 + ", broadcast.dequeuedBatches=" + deqB
++                + ", broadcast.enqRate_per_s=" + enqRate
++                + ", broadcast.deqRate_per_s=" + deqRate
++                + ", broadcast.drainBudget=" + drainBudget
+                 + ", broadcast.dropOverflow=" + dropOv
+                 + ", broadcast.dropTimeout=" + dropTo;
+         } catch (Throwable ignored) {}
+diff --git a/src/main/java/io/multipaper/herculi/threading/RegionSchedulers.java b/src/main/java/io/multipaper/herculi/threading/RegionSchedulers.java
+index f4ba6cf28bbf33e04cb6a2130f8bfa2481f8c3e1..54f560b20f2d09b7a2f793f8657737845db2cee1 100644
+--- a/src/main/java/io/multipaper/herculi/threading/RegionSchedulers.java
++++ b/src/main/java/io/multipaper/herculi/threading/RegionSchedulers.java
+@@ -9,6 +9,8 @@ import org.bukkit.entity.Player;
+ import java.util.Map;
+ import java.util.Objects;
+ import java.util.concurrent.*;
++import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.logging.Logger;
+ 
+ /**
+  * Phase 2 stub: region executors.
+@@ -26,6 +28,7 @@ public final class RegionSchedulers {
+     private static final ConcurrentMap<Long, Holder> EXECUTORS = new ConcurrentHashMap<>();
+     private static final HerculiInstrumentation INST = HerculiInstrumentation.instance();
+     private static final java.util.concurrent.atomic.AtomicLong ENQUEUE_COUNT = new java.util.concurrent.atomic.AtomicLong();
++    private static final AtomicBoolean LOGGED_EARLY_BOUNCE = new AtomicBoolean(false);
+ 
+     private RegionSchedulers() {}
+ 
+@@ -68,6 +71,21 @@ public final class RegionSchedulers {
+             task.run();
+             return;
+         }
++        // 0043: Ensure worlds are initialized before spinning region executors
++        try {
++            if (HerculiConfig.instance().getBoolean("world.init.attach_global_scheduler.enabled", true)) {
++                if (Bukkit.getWorlds().isEmpty()) {
++                    // Bounce directly on caller thread (typically main) until worlds are ready
++                    if (HerculiConfig.instance().getBoolean("world.init.attach_global_scheduler.log", true)) {
++                        if (LOGGED_EARLY_BOUNCE.compareAndSet(false, true)) {
++                            Logger.getLogger("Herculi").info("RegionSchedulers: world init not complete yet; executing tasks without region executor (one-time log)");
++                        }
++                    }
++                    task.run();
++                    return;
++                }
++            }
++        } catch (Throwable ignored) {}
+         final long key = regionKeyFor(player.getLocation());
+         // metrics + cleanup sampling
+         INST.incRegionTasksEnqueued();
+diff --git a/src/main/java/org/bukkit/craftbukkit/command/HerculiCommand.java b/src/main/java/org/bukkit/craftbukkit/command/HerculiCommand.java
+index f18bcdf399dd7a6ff5232fefe60f34a5cf3fdcaf..4a0b21ab10f1d652de8786f2926b2e225e8789de 100644
+--- a/src/main/java/org/bukkit/craftbukkit/command/HerculiCommand.java
++++ b/src/main/java/org/bukkit/craftbukkit/command/HerculiCommand.java
+@@ -5,21 +5,68 @@ import org.bukkit.command.CommandSender;
+ import org.jetbrains.annotations.NotNull;
+ import io.multipaper.herculi.threading.HerculiRegionLocker;
+ import io.multipaper.herculi.instrumentation.HerculiInstrumentation;
++import net.kyori.adventure.text.Component;
++import net.kyori.adventure.text.format.NamedTextColor;
++import net.kyori.adventure.text.format.TextDecoration;
+ 
+ public final class HerculiCommand extends org.bukkit.command.defaults.BukkitCommand {
+ 
+     public HerculiCommand() {
+         super("herculi");
+         this.setDescription("Herculi diagnostics and profiling commands");
+-        this.setUsage("/herculi <profile|locks|queues|reload> [args]");
++        this.setUsage("/herculi <profile|locks|queues|probe|reload|mpmap> [args]");
+         this.setPermission("herculi.command");
+     }
++    
++    private void sendFormattedMessage(CommandSender sender, String message, NamedTextColor color) {
++        Component component = Component.text("[Herculi] ", NamedTextColor.GOLD, TextDecoration.BOLD)
++            .append(Component.text(message, color));
++        sender.sendMessage(component);
++    }
++    
++    private void sendSuccessMessage(CommandSender sender, String message) {
++        sendFormattedMessage(sender, message, NamedTextColor.GREEN);
++    }
++    
++    private void sendErrorMessage(CommandSender sender, String message) {
++        sendFormattedMessage(sender, message, NamedTextColor.RED);
++    }
++    
++    private void sendInfoMessage(CommandSender sender, String message) {
++        sendFormattedMessage(sender, message, NamedTextColor.AQUA);
++    }
++    
++    private void sendUsageMessage(CommandSender sender, String usage) {
++        Component component = Component.text("Usage: ", NamedTextColor.YELLOW)
++            .append(Component.text(usage, NamedTextColor.WHITE));
++        sender.sendMessage(component);
++    }
+ 
+     @Override
+     public boolean execute(@NotNull CommandSender sender, @NotNull String label, @NotNull String[] args) {
+         if (!this.testPermission(sender)) return true;
+         if (args.length == 0) {
+-            sender.sendMessage("Usage: " + this.getUsage());
++            sendUsageMessage(sender, this.getUsage());
++            Component help = Component.text("\nAvailable commands:", NamedTextColor.GOLD, TextDecoration.BOLD)
++                .append(Component.text("\n• ", NamedTextColor.GRAY))
++                .append(Component.text("profile", NamedTextColor.YELLOW))
++                .append(Component.text(" - Start/stop performance profiling", NamedTextColor.WHITE))
++                .append(Component.text("\n• ", NamedTextColor.GRAY))
++                .append(Component.text("locks", NamedTextColor.YELLOW))
++                .append(Component.text(" - Show region lock statistics", NamedTextColor.WHITE))
++                .append(Component.text("\n• ", NamedTextColor.GRAY))
++                .append(Component.text("queues", NamedTextColor.YELLOW))
++                .append(Component.text(" - Show executor queue status", NamedTextColor.WHITE))
++                .append(Component.text("\n• ", NamedTextColor.GRAY))
++                .append(Component.text("probe", NamedTextColor.YELLOW))
++                .append(Component.text(" - Show detailed performance metrics", NamedTextColor.WHITE))
++                .append(Component.text("\n• ", NamedTextColor.GRAY))
++                .append(Component.text("mpmap", NamedTextColor.YELLOW))
++                .append(Component.text(" - Show visual region/chunk map", NamedTextColor.WHITE))
++                .append(Component.text("\n• ", NamedTextColor.GRAY))
++                .append(Component.text("reload", NamedTextColor.YELLOW))
++                .append(Component.text(" - Reload Herculi configuration", NamedTextColor.WHITE));
++            sender.sendMessage(help);
+             return true;
+         }
+         final String sub = args[0].toLowerCase();
+@@ -44,11 +91,11 @@ public final class HerculiCommand extends org.bukkit.command.defaults.BukkitComm
+                     final int drainBudget = cfg.fairnessEnabled() ? cfg.fairnessBroadcastDrainBudget() : cfg.broadcastingThreadedDrainBudget();
+                     io.multipaper.herculi.broadcast.BroadcastRegistry.init(bcEnabled, maxQueuesTotal, maxBatchesPerQueue, dropPolicy, drainBudget);
+                 } catch (Throwable ignored) {}
+-                sender.sendMessage("[Herculi] Configuration reloaded (fairness/broadcast budgets updated).");
++                sendSuccessMessage(sender, "Configuration reloaded (fairness/broadcast budgets updated).");
+                 return true;
+             case "profile":
+                 if (args.length < 2) {
+-                    sender.sendMessage("[Herculi] Usage: /herculi profile <start|stop> [jfr]");
++                    sendUsageMessage(sender, "/herculi profile <start|stop> [jfr]");
+                     return true;
+                 }
+                 String action = args[1].toLowerCase();
+@@ -56,16 +103,16 @@ public final class HerculiCommand extends org.bukkit.command.defaults.BukkitComm
+                     case "start": {
+                         boolean withJfr = args.length >= 3 && args[2].equalsIgnoreCase("jfr");
+                         String msg = io.multipaper.herculi.instrumentation.HerculiProfiler.instance().start(withJfr);
+-                        sender.sendMessage("[Herculi] " + msg);
++                        sendSuccessMessage(sender, msg);
+                         return true;
+                     }
+                     case "stop": {
+                         String msg = io.multipaper.herculi.instrumentation.HerculiProfiler.instance().stop();
+-                        sender.sendMessage("[Herculi] " + msg);
++                        sendSuccessMessage(sender, msg);
+                         return true;
+                     }
+                     default:
+-                        sender.sendMessage("[Herculi] Usage: /herculi profile <start|stop> [jfr]");
++                        sendUsageMessage(sender, "/herculi profile <start|stop> [jfr]");
+                         return true;
+                 }
+             case "locks":
+@@ -75,20 +122,31 @@ public final class HerculiCommand extends org.bukkit.command.defaults.BukkitComm
+                     final long pools = inst.regionPoolsCreated();
+                     final long enq = inst.regionTasksEnqueued();
+                     final long exe = inst.regionTasksExecuted();
+-                    sender.sendMessage("[Herculi] Locks: " + stats
+-                        + "; executors: poolsCreated=" + pools
+-                        + ", enqueued=" + enq
+-                        + ", executed=" + exe);
++                    Component locksInfo = Component.text("[Herculi] ", NamedTextColor.GOLD, TextDecoration.BOLD)
++                        .append(Component.text("Region Lock Statistics", NamedTextColor.AQUA, TextDecoration.UNDERLINED))
++                        .append(Component.text("\n• Lock Stats: ", NamedTextColor.YELLOW))
++                        .append(Component.text(stats, NamedTextColor.WHITE))
++                        .append(Component.text("\n• Executor Pools Created: ", NamedTextColor.YELLOW))
++                        .append(Component.text(String.valueOf(pools), NamedTextColor.GREEN))
++                        .append(Component.text("\n• Tasks Enqueued: ", NamedTextColor.YELLOW))
++                        .append(Component.text(String.valueOf(enq), NamedTextColor.GREEN))
++                        .append(Component.text("\n• Tasks Executed: ", NamedTextColor.YELLOW))
++                        .append(Component.text(String.valueOf(exe), NamedTextColor.GREEN));
++                    sender.sendMessage(locksInfo);
+                 } catch (Throwable t) {
+-                    sender.sendMessage("[Herculi] Locks diagnostics unavailable: " + t.getClass().getSimpleName());
++                    sendErrorMessage(sender, "Locks diagnostics unavailable: " + t.getClass().getSimpleName());
+                 }
+                 return true;
+             case "queues":
+                 try {
+                     String snapshot = io.multipaper.herculi.instrumentation.HerculiQueues.instance().snapshot();
+-                    sender.sendMessage("[Herculi] Queues: " + snapshot);
++                    Component queuesInfo = Component.text("[Herculi] ", NamedTextColor.GOLD, TextDecoration.BOLD)
++                        .append(Component.text("Queue Status", NamedTextColor.AQUA, TextDecoration.UNDERLINED))
++                        .append(Component.text("\n", NamedTextColor.WHITE))
++                        .append(Component.text(snapshot, NamedTextColor.WHITE));
++                    sender.sendMessage(queuesInfo);
+                 } catch (Throwable t) {
+-                    sender.sendMessage("[Herculi] Queues snapshot unavailable: " + t.getClass().getSimpleName());
++                    sendErrorMessage(sender, "Queues snapshot unavailable: " + t.getClass().getSimpleName());
+                 }
+                 return true;
+             case "probe":
+@@ -120,7 +178,7 @@ public final class HerculiCommand extends org.bukkit.command.defaults.BukkitComm
+                         try {
+                             // no reset API for broadcasting; clear by toggling gate if needed
+                         } catch (Throwable ignored) {}
+-                        sender.sendMessage("[Herculi] Probe counters reset.");
++                        sendSuccessMessage(sender, "Probe counters reset.");
+                         return true;
+                     }
+                     long lpSched = io.multipaper.herculi.instrumentation.LevelParallelProbe.getScheduled();
+@@ -132,6 +190,9 @@ public final class HerculiCommand extends org.bukkit.command.defaults.BukkitComm
+                     long bEnq = 0, bDrained = 0; int bQueues = 0;
+                     long cpHits = 0, cpBuilds = 0;
+                     long trackCapHits = 0;
++                    long netLazyWrites = 0, netFlushMerges = 0;
++                    long pingDeferrals = 0; int pingLastDelay = 0;
++                    long pSaveCount = 0, pSaveAvgUs = 0, pSaveMaxUs = 0;
+                     try {
+                         uCount = io.multipaper.herculi.instrumentation.HerculiUnloadMetrics.getCount();
+                         uAvgMicros = io.multipaper.herculi.instrumentation.HerculiUnloadMetrics.getAvgMicros();
+@@ -154,28 +215,174 @@ public final class HerculiCommand extends org.bukkit.command.defaults.BukkitComm
+                     try {
+                         trackCapHits = io.papermc.paper.FeatureHooks.herculi_getTrackingCapHits();
+                     } catch (Throwable ignored) {}
+-                    sender.sendMessage("[Herculi] Probe: levelProbe.scheduled=" + lpSched + ", levelProbe.completed=" + lpDone
+-                        + ", precompute.scheduled=" + pcSched + ", precompute.completed=" + pcDone
+-                        + ", unloads.count=" + uCount + ", unloads.avg_us=" + uAvgMicros + ", unloads.max_us=" + uMaxMicros
+-                        + ", be.count=" + beCount + ", be.avg_us=" + beAvgMicros + ", be.max_us=" + beMaxMicros
+-                        + ", bq.enqueued=" + bEnq + ", bq.drained=" + bDrained + ", bq.queues=" + bQueues
+-                        + ", cp.cache_hits=" + cpHits + ", cp.cache_builds=" + cpBuilds
+-                        + ", tracking.cap_hits=" + trackCapHits);
++                    try {
++                        netLazyWrites = io.papermc.paper.FeatureHooks.herculi_getNetLazyWrites();
++                        netFlushMerges = io.papermc.paper.FeatureHooks.herculi_getNetFlushMerges();
++                    } catch (Throwable ignored) {}
++                    try {
++                        pingDeferrals = io.papermc.paper.FeatureHooks.herculi_getPingDeferrals();
++                        pingLastDelay = io.papermc.paper.FeatureHooks.herculi_getPingLastDelayTicks();
++                    } catch (Throwable ignored) {}
++                    try {
++                        pSaveCount = io.papermc.paper.FeatureHooks.herculi_getPlayerSaveAsyncCount();
++                        pSaveAvgUs = io.papermc.paper.FeatureHooks.herculi_getPlayerSaveIoAvgMicros();
++                        pSaveMaxUs = io.papermc.paper.FeatureHooks.herculi_getPlayerSaveIoMaxMicros();
++                    } catch (Throwable ignored) {}
++                    Component probeInfo = Component.text("[Herculi] ", NamedTextColor.GOLD, TextDecoration.BOLD)
++                        .append(Component.text("Performance Probe Metrics", NamedTextColor.AQUA, TextDecoration.UNDERLINED))
++                        .append(Component.text("\n\n■ Level Processing:", NamedTextColor.LIGHT_PURPLE, TextDecoration.BOLD))
++                        .append(Component.text("\n  • Scheduled: ", NamedTextColor.YELLOW))
++                        .append(Component.text(String.valueOf(lpSched), NamedTextColor.GREEN))
++                        .append(Component.text(" | Completed: ", NamedTextColor.YELLOW))
++                        .append(Component.text(String.valueOf(lpDone), NamedTextColor.GREEN))
++                        .append(Component.text("\n\n■ Precompute:", NamedTextColor.LIGHT_PURPLE, TextDecoration.BOLD))
++                        .append(Component.text("\n  • Scheduled: ", NamedTextColor.YELLOW))
++                        .append(Component.text(String.valueOf(pcSched), NamedTextColor.GREEN))
++                        .append(Component.text(" | Completed: ", NamedTextColor.YELLOW))
++                        .append(Component.text(String.valueOf(pcDone), NamedTextColor.GREEN))
++                        .append(Component.text("\n\n■ Chunk Unloads:", NamedTextColor.LIGHT_PURPLE, TextDecoration.BOLD))
++                        .append(Component.text("\n  • Count: ", NamedTextColor.YELLOW))
++                        .append(Component.text(String.valueOf(uCount), NamedTextColor.GREEN))
++                        .append(Component.text(" | Avg: ", NamedTextColor.YELLOW))
++                        .append(Component.text(uAvgMicros + "μs", NamedTextColor.GREEN))
++                        .append(Component.text(" | Max: ", NamedTextColor.YELLOW))
++                        .append(Component.text(uMaxMicros + "μs", NamedTextColor.GREEN))
++                        .append(Component.text("\n\n■ Block Entities:", NamedTextColor.LIGHT_PURPLE, TextDecoration.BOLD))
++                        .append(Component.text("\n  • Count: ", NamedTextColor.YELLOW))
++                        .append(Component.text(String.valueOf(beCount), NamedTextColor.GREEN))
++                        .append(Component.text(" | Avg: ", NamedTextColor.YELLOW))
++                        .append(Component.text(beAvgMicros + "μs", NamedTextColor.GREEN))
++                        .append(Component.text(" | Max: ", NamedTextColor.YELLOW))
++                        .append(Component.text(beMaxMicros + "μs", NamedTextColor.GREEN))
++                        .append(Component.text("\n\n■ Broadcast Queues:", NamedTextColor.LIGHT_PURPLE, TextDecoration.BOLD))
++                        .append(Component.text("\n  • Enqueued: ", NamedTextColor.YELLOW))
++                        .append(Component.text(String.valueOf(bEnq), NamedTextColor.GREEN))
++                        .append(Component.text(" | Drained: ", NamedTextColor.YELLOW))
++                        .append(Component.text(String.valueOf(bDrained), NamedTextColor.GREEN))
++                        .append(Component.text(" | Active Queues: ", NamedTextColor.YELLOW))
++                        .append(Component.text(String.valueOf(bQueues), NamedTextColor.GREEN))
++                        .append(Component.text("\n\n■ Network Optimizations:", NamedTextColor.LIGHT_PURPLE, TextDecoration.BOLD))
++                        .append(Component.text("\n  • Cache Hits: ", NamedTextColor.YELLOW))
++                        .append(Component.text(String.valueOf(cpHits), NamedTextColor.GREEN))
++                        .append(Component.text(" | Cache Builds: ", NamedTextColor.YELLOW))
++                        .append(Component.text(String.valueOf(cpBuilds), NamedTextColor.GREEN))
++                        .append(Component.text("\n  • Lazy Writes: ", NamedTextColor.YELLOW))
++                        .append(Component.text(String.valueOf(netLazyWrites), NamedTextColor.GREEN))
++                        .append(Component.text(" | Flush Merges: ", NamedTextColor.YELLOW))
++                        .append(Component.text(String.valueOf(netFlushMerges), NamedTextColor.GREEN))
++                        .append(Component.text("\n  • Ping Deferrals: ", NamedTextColor.YELLOW))
++                        .append(Component.text(String.valueOf(pingDeferrals), NamedTextColor.GREEN))
++                        .append(Component.text(" | Last Delay: ", NamedTextColor.YELLOW))
++                        .append(Component.text(pingLastDelay + " ticks", NamedTextColor.GREEN))
++                        .append(Component.text("\n\n■ Player Saves:", NamedTextColor.LIGHT_PURPLE, TextDecoration.BOLD))
++                        .append(Component.text("\n  • Async Count: ", NamedTextColor.YELLOW))
++                        .append(Component.text(String.valueOf(pSaveCount), NamedTextColor.GREEN))
++                        .append(Component.text(" | Avg: ", NamedTextColor.YELLOW))
++                        .append(Component.text(pSaveAvgUs + "μs", NamedTextColor.GREEN))
++                        .append(Component.text(" | Max: ", NamedTextColor.YELLOW))
++                        .append(Component.text(pSaveMaxUs + "μs", NamedTextColor.GREEN));
++                    sender.sendMessage(probeInfo);
+                 } catch (Throwable t) {
+-                    sender.sendMessage("[Herculi] Probe unavailable: " + t.getClass().getSimpleName());
++                    sendErrorMessage(sender, "Probe unavailable: " + t.getClass().getSimpleName());
+                 }
+                 return true;
++            case "mpmap":
++                return handleMpmapCommand(sender, args);
+             default:
+-                sender.sendMessage("Unknown subcommand. " + this.getUsage());
++                sendErrorMessage(sender, "Unknown subcommand.");
++                sendUsageMessage(sender, this.getUsage());
+                 return true;
+         }
+     }
++    
++    private boolean handleMpmapCommand(CommandSender sender, String[] args) {
++        try {
++            org.bukkit.entity.Player player = null;
++            if (sender instanceof org.bukkit.entity.Player) {
++                player = (org.bukkit.entity.Player) sender;
++            } else if (args.length >= 2) {
++                player = org.bukkit.Bukkit.getPlayer(args[1]);
++                if (player == null) {
++                    sendErrorMessage(sender, "Player '" + args[1] + "' not found.");
++                    return true;
++                }
++            } else {
++                sendUsageMessage(sender, "/herculi mpmap [player]");
++                return true;
++            }
++            
++            org.bukkit.World world = player.getWorld();
++            org.bukkit.Location loc = player.getLocation();
++            // Bukkit Location has no direct getChunkX/Z; derive from block coordinates
++            int centerX = loc.getBlockX() >> 4;
++            int centerZ = loc.getBlockZ() >> 4;
++            int radius = 8; // Show 17x17 chunk area
++            
++            Component mapHeader = Component.text("[Herculi] ", NamedTextColor.GOLD, TextDecoration.BOLD)
++                .append(Component.text("Region/Chunk Map", NamedTextColor.AQUA, TextDecoration.UNDERLINED))
++                .append(Component.text("\nPlayer: ", NamedTextColor.YELLOW))
++                .append(Component.text(player.getName(), NamedTextColor.WHITE))
++                .append(Component.text(" | World: ", NamedTextColor.YELLOW))
++                .append(Component.text(world.getName(), NamedTextColor.WHITE))
++                .append(Component.text("\nCenter: ", NamedTextColor.YELLOW))
++                .append(Component.text("(" + centerX + ", " + centerZ + ")", NamedTextColor.WHITE))
++                .append(Component.text("\n\nLegend: ", NamedTextColor.GOLD))
++                .append(Component.text("█", NamedTextColor.GREEN))
++                .append(Component.text("=Loaded ", NamedTextColor.WHITE))
++                .append(Component.text("█", NamedTextColor.YELLOW))
++                .append(Component.text("=Loading ", NamedTextColor.WHITE))
++                .append(Component.text("█", NamedTextColor.RED))
++                .append(Component.text("=Unloaded ", NamedTextColor.WHITE))
++                .append(Component.text("█", NamedTextColor.LIGHT_PURPLE))
++                .append(Component.text("=Player ", NamedTextColor.WHITE))
++                .append(Component.text("\n"));
++            sender.sendMessage(mapHeader);
++            
++            // Generate the map
++            for (int z = centerZ - radius; z <= centerZ + radius; z++) {
++                Component line = Component.empty();
++                for (int x = centerX - radius; x <= centerX + radius; x++) {
++                    NamedTextColor color;
++                    String symbol;
++                    
++                    if (x == centerX && z == centerZ) {
++                        // Player position
++                        color = NamedTextColor.LIGHT_PURPLE;
++                        symbol = "@";
++                    } else {
++                        // Check chunk status
++                        boolean isLoaded = world.isChunkLoaded(x, z);
++                        if (isLoaded) {
++                            color = NamedTextColor.GREEN;
++                            symbol = "+";
++                        } else {
++                            color = NamedTextColor.RED;
++                            symbol = "-";
++                        }
++                    }
++                    
++                    line = line.append(Component.text(symbol, color));
++                }
++                sender.sendMessage(line);
++            }
++            
++            Component mapFooter = Component.text("\nRegion info: ", NamedTextColor.YELLOW)
++                .append(Component.text("(" + (centerX >> 5) + ", " + (centerZ >> 5) + ")", NamedTextColor.WHITE))
++                .append(Component.text(" | Chunks shown: ", NamedTextColor.YELLOW))
++                .append(Component.text(String.valueOf((radius * 2 + 1) * (radius * 2 + 1)), NamedTextColor.WHITE));
++            sender.sendMessage(mapFooter);
++            
++        } catch (Throwable t) {
++            sendErrorMessage(sender, "Mpmap unavailable: " + t.getClass().getSimpleName());
++        }
++        return true;
++    }
+ 
+     @Override
+     public java.util.List<String> tabComplete(@NotNull CommandSender sender, @NotNull String alias, @NotNull String[] args) {
+         java.util.List<String> out = new java.util.ArrayList<>();
+         if (args.length == 1) {
+-            java.util.List<String> roots = java.util.Arrays.asList("profile", "locks", "queues", "probe", "reload");
++            java.util.List<String> roots = java.util.Arrays.asList("profile", "locks", "queues", "probe", "reload", "mpmap");
+             String p = args[0].toLowerCase();
+             for (String r : roots) if (r.startsWith(p)) out.add(r);
+             return out;
+@@ -198,6 +405,16 @@ public final class HerculiCommand extends org.bukkit.command.defaults.BukkitComm
+             for (String r : opts) if (r.startsWith(p)) out.add(r);
+             return out;
+         }
++        if (args.length == 2 && args[0].equalsIgnoreCase("mpmap")) {
++            // Tab complete player names
++            String p = args[1].toLowerCase();
++            for (org.bukkit.entity.Player player : org.bukkit.Bukkit.getOnlinePlayers()) {
++                if (player.getName().toLowerCase().startsWith(p)) {
++                    out.add(player.getName());
++                }
++            }
++            return out;
++        }
+         return out;
+     }
+ }
+diff --git a/src/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java b/src/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java
+index da824b3641f8382339d650511e8ba13ad3c08da0..180d92c1a8a72a8e6e7c3d824598ecd92ddc34f3 100644
+--- a/src/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java
++++ b/src/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java
+@@ -858,6 +858,7 @@ public class CraftEventFactory {
+         snapshot.setData(state);
+ 
+         MoistureChangeEvent event = new MoistureChangeEvent(snapshot.getBlock(), snapshot);
++        ensureMainThread();
+         if (event.callEvent()) {
+             snapshot.place(flags);
+             return true;
+@@ -882,6 +883,7 @@ public class CraftEventFactory {
+         snapshot.setData(state);
+ 
+         BlockSpreadEvent event = new BlockSpreadEvent(snapshot.getBlock(), CraftBlock.at(world, CraftEventFactory.sourceBlockOverride != null ? CraftEventFactory.sourceBlockOverride : source), snapshot);
++        ensureMainThread();
+         if (event.callEvent()) {
+             boolean result = snapshot.place(flags);
+             return !checkSetResult || result;
+@@ -1226,6 +1228,7 @@ public class CraftEventFactory {
+         snapshot.setData(state);
+ 
+         BlockGrowEvent event = new BlockGrowEvent(snapshot.getBlock(), snapshot);
++        ensureMainThread();
+         if (event.callEvent()) {
+             snapshot.place(flags);
+             return true;
+@@ -1236,6 +1239,7 @@ public class CraftEventFactory {
+ 
+     public static FluidLevelChangeEvent callFluidLevelChangeEvent(Level world, BlockPos block, net.minecraft.world.level.block.state.BlockState newData) {
+         FluidLevelChangeEvent event = new FluidLevelChangeEvent(CraftBlock.at(world, block), CraftBlockData.fromData(newData));
++        ensureMainThread();
+         world.getCraftServer().getPluginManager().callEvent(event);
+         return event;
+     }
+@@ -1442,12 +1446,14 @@ public class CraftEventFactory {
+ 
+     public static BlockRedstoneEvent callRedstoneChange(Level world, BlockPos pos, int oldCurrent, int newCurrent) {
+         BlockRedstoneEvent event = new BlockRedstoneEvent(CraftBlock.at(world, pos), oldCurrent, newCurrent);
++        ensureMainThread();
+         world.getCraftServer().getPluginManager().callEvent(event);
+         return event;
+     }
+ 
+     public static NotePlayEvent callNotePlayEvent(Level world, BlockPos pos, NoteBlockInstrument instrument, int note) {
+         NotePlayEvent event = new NotePlayEvent(CraftBlock.at(world, pos), org.bukkit.Instrument.getByType((byte) instrument.ordinal()), new org.bukkit.Note(note));
++        ensureMainThread();
+         world.getCraftServer().getPluginManager().callEvent(event);
+         return event;
+     }
+@@ -1474,6 +1480,7 @@ public class CraftEventFactory {
+         }
+ 
+         BlockIgniteEvent event = new BlockIgniteEvent(CraftBlock.at(world, pos), cause, igniter);
++        ensureMainThread();
+         world.getCraftServer().getPluginManager().callEvent(event);
+         return event;
+     }
+@@ -1496,6 +1503,7 @@ public class CraftEventFactory {
+         }
+ 
+         BlockIgniteEvent event = new BlockIgniteEvent(CraftBlock.at(world, pos), cause, bukkitIgniter);
++        ensureMainThread();
+         world.getCraftServer().getPluginManager().callEvent(event);
+         return event;
+     }
+@@ -1504,12 +1512,14 @@ public class CraftEventFactory {
+         org.bukkit.entity.Entity igniter = explosion.getDirectSourceEntity() == null ? null : explosion.getDirectSourceEntity().getBukkitEntity();
+ 
+         BlockIgniteEvent event = new BlockIgniteEvent(CraftBlock.at(world, pos), IgniteCause.EXPLOSION, igniter);
++        ensureMainThread();
+         world.getCraftServer().getPluginManager().callEvent(event);
+         return event;
+     }
+ 
+     public static BlockIgniteEvent callBlockIgniteEvent(Level world, BlockPos pos, IgniteCause cause, Entity igniter) {
+         BlockIgniteEvent event = new BlockIgniteEvent(CraftBlock.at(world, pos), cause, igniter.getBukkitEntity());
++        ensureMainThread();
+         world.getCraftServer().getPluginManager().callEvent(event);
+         return event;
+     }
+@@ -1797,6 +1807,7 @@ public class CraftEventFactory {
+         BlockPhysicsEvent event = new BlockPhysicsEvent(block, block.getBlockData());
+         // Suppress during worldgen
+         if (world instanceof Level) {
++            ensureMainThread();
+             event.callEvent();
+         }
+         return event;
+@@ -1846,6 +1857,7 @@ public class CraftEventFactory {
+         snapshot.setData(state);
+ 
+         BlockFormEvent event = (entity == null) ? new BlockFormEvent(snapshot.getBlock(), snapshot) : new EntityBlockFormEvent(entity.getBukkitEntity(), snapshot.getBlock(), snapshot);
++        ensureMainThread();
+         if (event.callEvent()) {
+             boolean result = snapshot.place(flags);
+             return !checkSetResult || result;
+diff --git a/src/main/java/org/bukkit/craftbukkit/scheduler/CraftScheduler.java b/src/main/java/org/bukkit/craftbukkit/scheduler/CraftScheduler.java
+index c44db15b6c191bd0f6d60a900f7e96a0ca5f57d1..17a0ba40b53a0a730093da5abeab91031ac3281d 100644
+--- a/src/main/java/org/bukkit/craftbukkit/scheduler/CraftScheduler.java
++++ b/src/main/java/org/bukkit/craftbukkit/scheduler/CraftScheduler.java
+@@ -524,6 +524,29 @@ public class CraftScheduler implements BukkitScheduler {
+                 final int budget = Math.max(1, io.multipaper.herculi.config.HerculiConfig.instance().getInt("broadcasting.threaded.perTickDrainBudget", 4));
+                 io.multipaper.herculi.broadcast.BroadcastManager.instance().drainAll(budget);
+             }
++
++            // 0061: networking lazyExecute toggle
++            boolean lazy = cfg.getBoolean("networking.write.lazyExecute.enabled", false);
++            io.papermc.paper.FeatureHooks.herculi_setLazyExecuteEnabled(lazy);
++
++            // 0068: async player save toggle
++            boolean pAsync = cfg.getBoolean("async.player_save.enabled", false);
++            int pPool = Math.max(1, cfg.getInt("async.player_save.pool_size", 1));
++            io.papermc.paper.FeatureHooks.herculi_setAsyncPlayerSaveEnabled(pAsync, pPool);
++
++            // 0046: activation check frequency
++            int actInterval = Math.max(1, cfg.getInt("activation.check_immunities_interval", 20));
++            io.papermc.paper.FeatureHooks.herculi_setActivationCheckInterval(actInterval);
++
++            // 0038/0039: redstone gates
++            io.papermc.paper.FeatureHooks.herculi_setRedstoneACEnabled(cfg.getBoolean("redstone.ac.enabled", false));
++            io.papermc.paper.FeatureHooks.herculi_setRedstoneTurboEnabled(cfg.getBoolean("redstone.wire.turbo.enabled", false));
++            io.papermc.paper.FeatureHooks.herculi_setRedstoneThreadsafeNeighbors(cfg.getBoolean("redstone.threadsafe_neighbors.enabled", false));
++
++            // 0049: PotentialCalculator cache gate
++            boolean potEnabled = cfg.getBoolean("potential.cache.enabled", false);
++            int potSize = Math.max(64, cfg.getInt("potential.cache.size", 4096));
++            io.papermc.paper.PotentialHooks.setEnabled(potEnabled, potSize);
+         } catch (Throwable ignored) {}
+     }
+ 

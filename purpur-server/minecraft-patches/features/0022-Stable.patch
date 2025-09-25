@@ -1,0 +1,1351 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Angel <achaparro@lifeisthegame.email>
+Date: Wed, 24 Sep 2025 20:06:29 -0500
+Subject: [PATCH] Stable
+
+
+diff --git a/ca/spottedleaf/moonrise/common/misc/NearbyPlayers.java b/ca/spottedleaf/moonrise/common/misc/NearbyPlayers.java
+index 1b8193587814225c2ef2c5d9e667436eb50ff6c5..667840ac6e782ca6910fb14daba3586ff6aca1d6 100644
+--- a/ca/spottedleaf/moonrise/common/misc/NearbyPlayers.java
++++ b/ca/spottedleaf/moonrise/common/misc/NearbyPlayers.java
+@@ -154,6 +154,36 @@ public final class NearbyPlayers {
+         return this.directByChunk[type.ordinal()].get(CoordinateUtils.getChunkKey(blockX >> 4, blockZ >> 4));
+     }
+ 
++    /**
++     * Snapshot players in the given chunk and map type into a new array sized to the current list.
++     * Intended for main-thread use. Returns an empty array if none.
++     */
++    public ServerPlayer[] snapshotPlayersByChunk(final int chunkX, final int chunkZ, final NearbyMapType type) {
++        final ReferenceList<ServerPlayer> list = this.directByChunk[type.ordinal()].get(CoordinateUtils.getChunkKey(chunkX, chunkZ));
++        if (list == null) return new ServerPlayer[0];
++        final Object[] raw = list.getRawData();
++        final int size = list.size();
++        final ServerPlayer[] out = new ServerPlayer[size];
++        for (int i = 0; i < size; i++) {
++            out[i] = (ServerPlayer) raw[i];
++        }
++        return out;
++    }
++
++    /**
++     * Fast foreach over players in a given chunk and map type without allocations.
++     * Captures a size snapshot and iterates the backing array directly.
++     */
++    public void forEachByChunk(final int chunkX, final int chunkZ, final NearbyMapType type, final java.util.function.Consumer<ServerPlayer> action) {
++        final ReferenceList<ServerPlayer> list = this.directByChunk[type.ordinal()].get(CoordinateUtils.getChunkKey(chunkX, chunkZ));
++        if (list == null) return;
++        final Object[] raw = list.getRawData();
++        final int size = list.size();
++        for (int i = 0; i < size; i++) {
++            action.accept((ServerPlayer) raw[i]);
++        }
++    }
++
+     public static final class TrackedChunk {
+ 
+         private static final ServerPlayer[] EMPTY_PLAYERS_ARRAY = new ServerPlayer[0];
+diff --git a/io/papermc/paper/FeatureHooks.java b/io/papermc/paper/FeatureHooks.java
+index ea805ae0bc720dd97bb362c4e4c70f75f5b09f77..cf2af9135de9ff1f2ca0235a5d1ba87bc81b2a5c 100644
+--- a/io/papermc/paper/FeatureHooks.java
++++ b/io/papermc/paper/FeatureHooks.java
+@@ -190,7 +190,6 @@ public final class FeatureHooks {
+     public static void setViewDistance(ServerPlayer player, int distance) {
+         ((ca.spottedleaf.moonrise.patches.chunk_system.player.ChunkSystemServerPlayer)player).moonrise$getViewDistanceHolder().setLoadViewDistance(distance == -1 ? distance : distance + 1); // Paper - rewrite chunk system
+     }
+-
+     public static void setSimulationDistance(ServerPlayer player, int distance) {
+         ((ca.spottedleaf.moonrise.patches.chunk_system.player.ChunkSystemServerPlayer)player).moonrise$getViewDistanceHolder().setTickViewDistance(distance); // Paper - rewrite chunk system
+     }
+@@ -216,4 +215,75 @@ public final class FeatureHooks {
+     public static java.util.Set<String> herculi_getTrackingHeavyTypes() { return HERCULI_TRACKING_HEAVY_TYPES; }
+     public static void herculi_incTrackingCapHits() { HERCULI_TRACKING_CAP_HITS.incrementAndGet(); }
+     public static long herculi_getTrackingCapHits() { return HERCULI_TRACKING_CAP_HITS.get(); }
++
++    // Herculi - Networking lazyExecute (0061)
++    private static volatile boolean HERCULI_LAZY_EXECUTE_ENABLED = false;
++    private static final java.util.concurrent.atomic.AtomicLong HERCULI_NET_LAZY_WRITES = new java.util.concurrent.atomic.AtomicLong();
++    private static final java.util.concurrent.atomic.AtomicLong HERCULI_NET_FLUSH_MERGES = new java.util.concurrent.atomic.AtomicLong();
++    public static void herculi_setLazyExecuteEnabled(boolean enabled) { HERCULI_LAZY_EXECUTE_ENABLED = enabled; }
++    public static boolean herculi_isLazyExecuteEnabled() { return HERCULI_LAZY_EXECUTE_ENABLED; }
++    public static void herculi_incNetLazyWrites() { HERCULI_NET_LAZY_WRITES.incrementAndGet(); }
++    public static void herculi_incNetFlushMerges() { HERCULI_NET_FLUSH_MERGES.incrementAndGet(); }
++    public static long herculi_getNetLazyWrites() { return HERCULI_NET_LAZY_WRITES.get(); }
++    public static long herculi_getNetFlushMerges() { return HERCULI_NET_FLUSH_MERGES.get(); }
++
++    // Herculi - Ping defer (0054)
++    private static final java.util.concurrent.atomic.AtomicLong HERCULI_PING_DEFERRALS = new java.util.concurrent.atomic.AtomicLong();
++    private static final java.util.concurrent.atomic.AtomicInteger HERCULI_PING_LAST_DELAY = new java.util.concurrent.atomic.AtomicInteger();
++    public static void herculi_incPingDeferrals(int delayTicks) { HERCULI_PING_DEFERRALS.incrementAndGet(); HERCULI_PING_LAST_DELAY.set(delayTicks); }
++    public static long herculi_getPingDeferrals() { return HERCULI_PING_DEFERRALS.get(); }
++    public static int herculi_getPingLastDelayTicks() { return HERCULI_PING_LAST_DELAY.get(); }
++
++    // Herculi - Async player saves (0068)
++    private static volatile boolean HERCULI_ASYNC_PSAVE_ENABLED = false;
++    private static volatile int HERCULI_ASYNC_PSAVE_POOL = 1;
++    private static final java.util.concurrent.atomic.AtomicLong HERCULI_PSAVE_ASYNC_COUNT = new java.util.concurrent.atomic.AtomicLong();
++    private static final java.util.concurrent.atomic.AtomicLong HERCULI_PSAVE_IO_MICROS = new java.util.concurrent.atomic.AtomicLong();
++    private static final java.util.concurrent.atomic.AtomicLong HERCULI_PSAVE_IO_MAX_MICROS = new java.util.concurrent.atomic.AtomicLong();
++    public static void herculi_setAsyncPlayerSaveEnabled(boolean enabled, int pool) { HERCULI_ASYNC_PSAVE_ENABLED = enabled; HERCULI_ASYNC_PSAVE_POOL = Math.max(1, pool); }
++    public static boolean herculi_isAsyncPlayerSaveEnabled() { return HERCULI_ASYNC_PSAVE_ENABLED; }
++    public static int herculi_getAsyncPlayerSavePool() { return HERCULI_ASYNC_PSAVE_POOL; }
++    public static void herculi_recordPlayerSaveIoMicros(long micros) {
++        HERCULI_PSAVE_ASYNC_COUNT.incrementAndGet();
++        HERCULI_PSAVE_IO_MICROS.addAndGet(micros);
++        for (long prev; micros > (prev = HERCULI_PSAVE_IO_MAX_MICROS.get()) && !HERCULI_PSAVE_IO_MAX_MICROS.compareAndSet(prev, micros); ) {}
++    }
++    public static long herculi_getPlayerSaveAsyncCount() { return HERCULI_PSAVE_ASYNC_COUNT.get(); }
++    public static long herculi_getPlayerSaveIoAvgMicros() { long c = HERCULI_PSAVE_ASYNC_COUNT.get(); return c == 0 ? 0L : HERCULI_PSAVE_IO_MICROS.get() / c; }
++    public static long herculi_getPlayerSaveIoMaxMicros() { return HERCULI_PSAVE_IO_MAX_MICROS.get(); }
++
++    // Herculi - Activation check frequency (0046)
++    private static volatile int HERCULI_ACTIVATION_CHECK_INTERVAL = 20;
++    private static final java.util.concurrent.atomic.AtomicLong HERCULI_ACTIVATION_EVALS = new java.util.concurrent.atomic.AtomicLong();
++    private static final java.util.concurrent.atomic.AtomicLong HERCULI_ACTIVATION_SKIPS = new java.util.concurrent.atomic.AtomicLong();
++    public static void herculi_setActivationCheckInterval(int interval) { HERCULI_ACTIVATION_CHECK_INTERVAL = Math.max(1, interval); }
++    public static int herculi_getActivationCheckInterval() { return HERCULI_ACTIVATION_CHECK_INTERVAL; }
++    public static void herculi_incActivationEvals() { HERCULI_ACTIVATION_EVALS.incrementAndGet(); }
++    public static void herculi_incActivationSkips() { HERCULI_ACTIVATION_SKIPS.incrementAndGet(); }
++    public static long herculi_getActivationEvals() { return HERCULI_ACTIVATION_EVALS.get(); }
++    public static long herculi_getActivationSkips() { return HERCULI_ACTIVATION_SKIPS.get(); }
++
++    // Herculi - Redstone (0038/0039)
++    private static volatile boolean HERCULI_REDSTONE_AC_ENABLED = false;
++    private static volatile boolean HERCULI_REDSTONE_TURBO_ENABLED = false;
++    private static volatile boolean HERCULI_REDSTONE_THREADSAFE_NEIGHBORS = false;
++    private static final java.util.concurrent.atomic.AtomicLong HERCULI_REDSTONE_WIRE_EVALS = new java.util.concurrent.atomic.AtomicLong();
++    private static final java.util.concurrent.atomic.AtomicLong HERCULI_REDSTONE_WIRE_TURBO_EVALS = new java.util.concurrent.atomic.AtomicLong();
++    private static final java.util.concurrent.atomic.AtomicLong HERCULI_REDSTONE_NEIGHBOR_ENQUEUES = new java.util.concurrent.atomic.AtomicLong();
++    private static final java.util.concurrent.atomic.AtomicLong HERCULI_REDSTONE_NEIGHBOR_DEDUPES = new java.util.concurrent.atomic.AtomicLong();
++    public static void herculi_setRedstoneACEnabled(boolean enabled) { HERCULI_REDSTONE_AC_ENABLED = enabled; }
++    public static void herculi_setRedstoneTurboEnabled(boolean enabled) { HERCULI_REDSTONE_TURBO_ENABLED = enabled; }
++    public static void herculi_setRedstoneThreadsafeNeighbors(boolean enabled) { HERCULI_REDSTONE_THREADSAFE_NEIGHBORS = enabled; }
++    public static boolean herculi_isRedstoneACEnabled() { return HERCULI_REDSTONE_AC_ENABLED; }
++    public static boolean herculi_isRedstoneTurboEnabled() { return HERCULI_REDSTONE_TURBO_ENABLED; }
++    public static boolean herculi_isRedstoneThreadsafeNeighborsEnabled() { return HERCULI_REDSTONE_THREADSAFE_NEIGHBORS; }
++    public static void herculi_incRedstoneWireEvals() { HERCULI_REDSTONE_WIRE_EVALS.incrementAndGet(); }
++    public static void herculi_incRedstoneWireTurboEvals() { HERCULI_REDSTONE_WIRE_TURBO_EVALS.incrementAndGet(); }
++    public static void herculi_incRedstoneNeighborEnqueues() { HERCULI_REDSTONE_NEIGHBOR_ENQUEUES.incrementAndGet(); }
++    public static void herculi_incRedstoneNeighborDedupes() { HERCULI_REDSTONE_NEIGHBOR_DEDUPES.incrementAndGet(); }
++    public static long herculi_getRedstoneWireEvals() { return HERCULI_REDSTONE_WIRE_EVALS.get(); }
++    public static long herculi_getRedstoneWireTurboEvals() { return HERCULI_REDSTONE_WIRE_TURBO_EVALS.get(); }
++    public static long herculi_getRedstoneNeighborEnqueues() { return HERCULI_REDSTONE_NEIGHBOR_ENQUEUES.get(); }
++    public static long herculi_getRedstoneNeighborDedupes() { return HERCULI_REDSTONE_NEIGHBOR_DEDUPES.get(); }
++
+ }
+\ No newline at end of file
+diff --git a/io/papermc/paper/PotentialHooks.java b/io/papermc/paper/PotentialHooks.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..4105efc957cb12a2fa39f7d4c476c9f61aad3a63
+--- /dev/null
++++ b/io/papermc/paper/PotentialHooks.java
+@@ -0,0 +1,29 @@
++package io.papermc.paper;
++
++public final class PotentialHooks {
++    private PotentialHooks() {}
++
++    private static volatile boolean ENABLED = false;
++    private static volatile int SIZE = 4096; // must be power-of-two; will be clamped by setter
++
++    private static final java.util.concurrent.atomic.AtomicLong HITS = new java.util.concurrent.atomic.AtomicLong();
++    private static final java.util.concurrent.atomic.AtomicLong MISSES = new java.util.concurrent.atomic.AtomicLong();
++
++    public static void setEnabled(boolean enabled, int size) {
++        ENABLED = enabled;
++        SIZE = Math.max(64, highestPowerOfTwo(Math.min(Math.max(size, 64), 1 << 20))); // clamp 64..1M and pow2
++    }
++
++    public static boolean isEnabled() { return ENABLED; }
++    public static int cacheSize() { return SIZE; }
++
++    public static void incHit() { HITS.incrementAndGet(); }
++    public static void incMiss() { MISSES.incrementAndGet(); }
++    public static long getHits() { return HITS.get(); }
++    public static long getMisses() { return MISSES.get(); }
++
++    private static int highestPowerOfTwo(int v) {
++        // Round down to highest power-of-two
++        return Integer.highestOneBit(v);
++    }
++}
+diff --git a/io/papermc/paper/entity/activation/ActivationRange.java b/io/papermc/paper/entity/activation/ActivationRange.java
+index ca21597263cb430e2a5ae07e8cecfb0d53a270d2..940b8b4610ddd4236086ea9acf4c945ab0931050 100644
+--- a/io/papermc/paper/entity/activation/ActivationRange.java
++++ b/io/papermc/paper/entity/activation/ActivationRange.java
+@@ -310,8 +310,9 @@ public final class ActivationRange {
+ 
+         // Should this entity tick?
+         if (!isActive) {
+-            if ((MinecraftServer.currentTick - entity.activatedTick - 1) % 20 == 0) {
+-                // Check immunities every 20 ticks.
++            final int interval = io.papermc.paper.FeatureHooks.herculi_getActivationCheckInterval();
++            if ((MinecraftServer.currentTick - entity.activatedTick - 1) % interval == 0) {
++                // Check immunities on configured interval.
+                 final int immunity = checkEntityImmunities(entity);
+                 if (immunity >= 0) {
+                     entity.activatedTick = MinecraftServer.currentTick + immunity;
+@@ -319,6 +320,9 @@ public final class ActivationRange {
+                     entity.isTemporarilyActive = true;
+                 }
+                 isActive = true;
++                try { io.papermc.paper.FeatureHooks.herculi_incActivationEvals(); } catch (Throwable ignored) {}
++            } else {
++                try { io.papermc.paper.FeatureHooks.herculi_incActivationSkips(); } catch (Throwable ignored) {}
+             }
+         }
+         // removed the original's dumb tick skipping for active entities
+diff --git a/net/minecraft/network/Connection.java b/net/minecraft/network/Connection.java
+index 6e4c5b10aeb043c147ebbbb9bfbbb54f5ec4cc22..958387c0e2c52ca18a8090159ff16ef0e4bf8974 100644
+--- a/net/minecraft/network/Connection.java
++++ b/net/minecraft/network/Connection.java
+@@ -106,6 +106,8 @@ public class Connection extends SimpleChannelInboundHandler<Packet<?>> {
+     private float averageReceivedPackets;
+     private float averageSentPackets;
+     private int tickCount;
++    // Herculi 0061 - track if we performed lazy writes this tick to merge into a single flush
++    private boolean herculiLazyWroteThisTick;
+     private boolean handlingFault;
+     @Nullable
+     private volatile DisconnectionDetails delayedDisconnect;
+@@ -456,6 +458,18 @@ public class Connection extends SimpleChannelInboundHandler<Packet<?>> {
+             }
+ 
+             this.flushQueue();
++        // Herculi 0061 - if we performed lazy writes this tick, flush once to merge
++        if (this.herculiLazyWroteThisTick && this.isConnected()) {
++            this.herculiLazyWroteThisTick = false;
++            try {
++                if (this.channel.eventLoop().inEventLoop()) {
++                    this.channel.flush();
++                } else {
++                    this.channel.eventLoop().execute(() -> this.channel.flush());
++                }
++                io.papermc.paper.FeatureHooks.herculi_incNetFlushMerges();
++            } catch (Throwable ignored) {}
++        }
+             // Paper end - Optimize network
+         }
+     }
+@@ -488,11 +502,30 @@ public class Connection extends SimpleChannelInboundHandler<Packet<?>> {
+         try {
+         final ChannelFuture channelFuture;
+         // Paper end - Optimize network
++        // Herculi 0061 - convert to lazy write (no flush) when enabled and safe
++        boolean lazy = io.papermc.paper.FeatureHooks.herculi_isLazyExecuteEnabled()
++            && io.papermc.paper.util.MCUtil.isMainThread()
++            && flag // caller requested flush normally; we will coalesce
++            && !packet.hasFinishListener() // avoid changing listener timing semantics
++            && !(packet instanceof net.minecraft.network.protocol.common.ClientboundDisconnectPacket) // do not delay disconnects
++            ;
+         if (channelFutureListener != null) {
+-            channelFuture = flag ? this.channel.writeAndFlush(packet) : this.channel.write(packet); // Paper - Optimize network
++            if (lazy) {
++                channelFuture = this.channel.write(packet); // no flush
++                io.papermc.paper.FeatureHooks.herculi_incNetLazyWrites();
++                this.herculiLazyWroteThisTick = true;
++            } else {
++                channelFuture = flag ? this.channel.writeAndFlush(packet) : this.channel.write(packet); // Paper - Optimize network
++            }
+             channelFuture.addListener(channelFutureListener);
+         } else if (flag) {
+-            channelFuture = this.channel.writeAndFlush(packet, this.channel.voidPromise()); // Paper - Optimize network
++            if (lazy) {
++                channelFuture = this.channel.write(packet, this.channel.voidPromise()); // no flush
++                io.papermc.paper.FeatureHooks.herculi_incNetLazyWrites();
++                this.herculiLazyWroteThisTick = true;
++            } else {
++                channelFuture = this.channel.writeAndFlush(packet, this.channel.voidPromise()); // Paper - Optimize network
++            }
+         } else {
+             channelFuture = this.channel.write(packet, this.channel.voidPromise()); // Paper - Optimize network
+         }
+diff --git a/net/minecraft/server/commands/KillCommand.java b/net/minecraft/server/commands/KillCommand.java
+index f1a41d873c2eb2f519b0cd6adfcd9ef675e65195..cda6f25e7dc37dab2b92fa7bcb30de982feea68f 100644
+--- a/net/minecraft/server/commands/KillCommand.java
++++ b/net/minecraft/server/commands/KillCommand.java
+@@ -24,7 +24,25 @@ public class KillCommand {
+ 
+     private static int kill(CommandSourceStack source, Collection<? extends Entity> targets) {
+         for (Entity entity : targets) {
+-            entity.kill(source.getLevel());
++            final net.minecraft.world.level.Level entityLevel = entity.level();
++            if (!(entityLevel instanceof net.minecraft.server.level.ServerLevel serverLevel)) {
++                entity.kill(source.getLevel());
++                continue;
++            }
++            final net.minecraft.core.BlockPos pos = entity.blockPosition();
++            if (ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(serverLevel, pos.getX() >> 4, pos.getZ() >> 4)) {
++                entity.kill(serverLevel);
++            } else {
++                final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
++                io.multipaper.herculi.threading.WorldRegionScheduler.execute(serverLevel, pos.getX(), pos.getZ(), () -> {
++                    try {
++                        entity.kill(serverLevel);
++                    } finally {
++                        latch.countDown();
++                    }
++                });
++                try { latch.await(); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
++            }
+         }
+ 
+         if (targets.size() == 1) {
+diff --git a/net/minecraft/server/level/ChunkMap.java b/net/minecraft/server/level/ChunkMap.java
+index 72064cf08dbe6272e0b8d3c541b844ac30bd0668..7494b5c5ce620fb1125c83e9fac251630caa09de 100644
+--- a/net/minecraft/server/level/ChunkMap.java
++++ b/net/minecraft/server/level/ChunkMap.java
+@@ -250,16 +250,12 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+         }
+ 
+         final int index = entity.getType().getCategory().ordinal();
+-        final ca.spottedleaf.moonrise.common.list.ReferenceList<ServerPlayer> inRange =
+-            this.level.moonrise$getNearbyPlayers().getPlayers(entity.chunkPosition(), ca.spottedleaf.moonrise.common.misc.NearbyPlayers.NearbyMapType.TICK_VIEW_DISTANCE);
+-        if (inRange == null) {
+-            return;
+-        }
+-
+-        final ServerPlayer[] backingSet = inRange.getRawDataUnchecked();
+-        for (int i = 0, len = inRange.size(); i < len; i++) {
+-            ++(backingSet[i].mobCounts[index]);
+-        }
++        final net.minecraft.world.level.ChunkPos cp = entity.chunkPosition();
++        this.level.moonrise$getNearbyPlayers().forEachByChunk(
++            cp.x, cp.z,
++            ca.spottedleaf.moonrise.common.misc.NearbyPlayers.NearbyMapType.TICK_VIEW_DISTANCE,
++            (serverPlayer) -> { ++(serverPlayer.mobCounts[index]); }
++        );
+     }
+ 
+     // Paper start - per player mob count backoff
+@@ -268,15 +264,11 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+             return;
+         }
+         int idx = mobCategory.ordinal();
+-        final ca.spottedleaf.moonrise.common.list.ReferenceList<ServerPlayer> inRange =
+-            this.level.moonrise$getNearbyPlayers().getPlayersByChunk(chunkX, chunkZ, ca.spottedleaf.moonrise.common.misc.NearbyPlayers.NearbyMapType.TICK_VIEW_DISTANCE);
+-        if (inRange == null) {
+-            return;
+-        }
+-        final ServerPlayer[] backingSet = inRange.getRawDataUnchecked();
+-        for (int i = 0, len = inRange.size(); i < len; i++) {
+-            ++(backingSet[i].mobBackoffCounts[idx]);
+-        }
++        this.level.moonrise$getNearbyPlayers().forEachByChunk(
++            chunkX, chunkZ,
++            ca.spottedleaf.moonrise.common.misc.NearbyPlayers.NearbyMapType.TICK_VIEW_DISTANCE,
++            (serverPlayer) -> { ++(serverPlayer.mobBackoffCounts[idx]); }
++        );
+     }
+     // Paper end - per player mob count backoff
+     public int getMobCountNear(final ServerPlayer player, final net.minecraft.world.entity.MobCategory mobCategory) {
+@@ -1143,10 +1135,15 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+         private final int range;
+         SectionPos lastSectionPos;
+         public final java.util.Set<ServerPlayerConnection> seenBy = java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<ServerPlayerConnection, Boolean>()); // Paper - Perf: optimise map impl; Herculi - thread-safe set to avoid CME
++        // 0019: WeakSeqLock to provide stable reader snapshots for broadcasting
++        private final io.multipaper.herculi.concurrent.WeakSeqLock herculiSeq = new io.multipaper.herculi.concurrent.WeakSeqLock();
++        private boolean herculi$loggedTrackerCap = false; // 0064: ensure one-time log when cap is hit
+ 
+         // Paper start - optimise entity tracker
+         private long lastChunkUpdate = -1L;
+         private ca.spottedleaf.moonrise.common.misc.NearbyPlayers.TrackedChunk lastTrackedChunk;
++        // 0060: Vanish visibility cache per tick to reduce canSee() overhead
++        private final java.util.Map<java.util.UUID, java.lang.Boolean> herculi$vanishVisibleCache = new java.util.concurrent.ConcurrentHashMap<>();
+ 
+         @Override
+         public final void moonrise$tick(final ca.spottedleaf.moonrise.common.misc.NearbyPlayers.TrackedChunk chunk) {
+@@ -1167,6 +1164,8 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+             final ca.spottedleaf.moonrise.common.misc.NearbyPlayers.TrackedChunk lastTrackedChunk = this.lastTrackedChunk;
+             this.lastChunkUpdate = currChunkUpdate;
+             this.lastTrackedChunk = chunk;
++            // 0060: reset vanish cache when player list may have changed
++            this.herculi$vanishVisibleCache.clear();
+ 
+             final ServerPlayer[] playersRaw = players.getRawDataUnchecked();
+ 
+@@ -1234,6 +1233,18 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+             this.lastSectionPos = SectionPos.of(entity);
+         }
+ 
++        // 0019: Build a stable snapshot of current viewers; retry if concurrent write intervened
++        private java.util.List<ServerPlayerConnection> herculi$getViewerSnapshot() {
++            for (;;) {
++                final int stamp = this.herculiSeq.tryReadBegin();
++                final java.util.ArrayList<ServerPlayerConnection> snapshot = new java.util.ArrayList<>(this.seenBy);
++                if (this.herculiSeq.tryReadValidate(stamp)) {
++                    return snapshot;
++                }
++                // writer intervened; retry
++            }
++        }
++
+         @Override
+         public boolean equals(Object other) {
+             return other instanceof ChunkMap.TrackedEntity && ((ChunkMap.TrackedEntity)other).entity.getId() == this.entity.getId();
+@@ -1302,41 +1313,61 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+                 flag = flag && this.entity.broadcastToPlayer(player) && ChunkMap.this.isChunkTracked(player, this.entity.chunkPosition().x, this.entity.chunkPosition().z);
+                 // Paper end - Configurable entity tracking range by Y
+                 // CraftBukkit start - respect vanish API
+-                if (flag && !player.getBukkitEntity().canSee(this.entity.getBukkitEntity())) { // Paper - only consider hits
+-                    flag = false;
++                if (flag) {
++                    // 0060: optional cached vanish visibility
++                    boolean visible = true;
++                    try {
++                        if (io.multipaper.herculi.config.HerculiConfig.instance().getBoolean("entities.tracker.vanish.cache.enabled", true)) {
++                            java.util.UUID pid = player.getUUID();
++                            java.lang.Boolean cached = this.herculi$vanishVisibleCache.get(pid);
++                            if (cached == null) {
++                                cached = player.getBukkitEntity().canSee(this.entity.getBukkitEntity());
++                                this.herculi$vanishVisibleCache.put(pid, cached);
++                            }
++                            visible = cached;
++                        } else {
++                            visible = player.getBukkitEntity().canSee(this.entity.getBukkitEntity());
++                        }
++                    } catch (Throwable ignored) {}
++                    if (!visible) {
++                        // Paper - only consider hits
++                        flag = false;
++                    }
++                }
++                if (flag) {
+                 }
+                 // CraftBukkit end
+                 if (flag) {
+                     // Herculi 0064: tracking caps (heavy types + global fallback)
+-                    {
+-                        int capToUse = 0;
+-                        // heavy check by class to avoid string mapping cost
+-                        try {
+-                            java.util.Set<String> heavyTypes = io.papermc.paper.FeatureHooks.herculi_getTrackingHeavyTypes();
+-                            boolean isHeavy = (heavyTypes.contains("ITEM") && (this.entity instanceof net.minecraft.world.entity.item.ItemEntity))
+-                                    || (heavyTypes.contains("PROJECTILE") && (this.entity instanceof net.minecraft.world.entity.projectile.Projectile));
+-                            if (isHeavy) {
+-                                capToUse = io.papermc.paper.FeatureHooks.herculi_getTrackingCapHeavy();
+-                            }
+-                        } catch (Throwable ignored) {}
+-                        if (capToUse <= 0) {
+-                            capToUse = io.papermc.paper.FeatureHooks.herculi_getTrackingCapGlobal();
++                    int capToUse = 0;
++                    try {
++                        java.util.Set<String> heavyTypes = io.papermc.paper.FeatureHooks.herculi_getTrackingHeavyTypes();
++                        boolean isHeavy = (heavyTypes.contains("ITEM") && (this.entity instanceof net.minecraft.world.entity.item.ItemEntity))
++                                || (heavyTypes.contains("PROJECTILE") && (this.entity instanceof net.minecraft.world.entity.projectile.Projectile));
++                        if (isHeavy) {
++                            capToUse = io.papermc.paper.FeatureHooks.herculi_getTrackingCapHeavy();
+                         }
+-                        if (capToUse > 0) {
+-                            // enforce cap before attempting to add
+-                            if (this.seenBy.size() >= capToUse) {
+-                                // record a cap hit and skip adding this player as a tracker
+-                                try { io.papermc.paper.FeatureHooks.herculi_incTrackingCapHits(); } catch (Throwable ignored) {}
+-                                return; // do not add tracking for this player
+-                            }
++                    } catch (Throwable ignored) {}
++                    if (capToUse <= 0) {
++                        capToUse = io.papermc.paper.FeatureHooks.herculi_getTrackingCapGlobal();
++                    }
++                    if (capToUse > 0 && this.seenBy.size() >= capToUse && !this.seenBy.contains(player.connection)) {
++                        try { io.papermc.paper.FeatureHooks.herculi_incTrackingCapHits(); } catch (Throwable ignored) {}
++                        return; // skip adding due to heavy/global cap
++                    }
++
++                    // 0064: Global max-per-entity cap from herculi config
++                    final int cap = Math.max(1, io.multipaper.herculi.config.HerculiConfig.instance().getInt("entities.tracker.max_per_entity", 512));
++                    if (!this.seenBy.contains(player.connection) && this.seenBy.size() >= cap) {
++                        if (io.multipaper.herculi.config.HerculiConfig.instance().getBoolean("entities.tracker.cap.log", true) && !herculi$loggedTrackerCap) {
++                            herculi$loggedTrackerCap = true;
++                            org.bukkit.Bukkit.getLogger().warning("Tracker cap reached for entity " + this.entity.getStringUUID() + " type=" + this.entity.getType() + " cap=" + cap);
+                         }
++                        return; // do not add more viewers beyond cap
+                     }
++
+                     if (this.seenBy.add(player.connection)) {
+-                        // Paper start - entity tracking events
+-                        if (io.papermc.paper.event.player.PlayerTrackEntityEvent.getHandlerList().getRegisteredListeners().length == 0 || new io.papermc.paper.event.player.PlayerTrackEntityEvent(player.getBukkitEntity(), this.entity.getBukkitEntity()).callEvent()) {
+                         this.serverEntity.addPairing(player);
+-                        }
+-                        // Paper end - entity tracking events
+                         this.serverEntity.onPlayerAdd(); // Paper - fix desync when a player is added to the tracker
+                     }
+                 } else if (this.seenBy.remove(player.connection)) {
+diff --git a/net/minecraft/server/network/ServerCommonPacketListenerImpl.java b/net/minecraft/server/network/ServerCommonPacketListenerImpl.java
+index 436f753d00f3854c481c95e4ddacfd9fac9932d4..ff097777e540e6763751ac7e9daa7cddc8425245 100644
+--- a/net/minecraft/server/network/ServerCommonPacketListenerImpl.java
++++ b/net/minecraft/server/network/ServerCommonPacketListenerImpl.java
+@@ -25,6 +25,7 @@ import net.minecraft.network.protocol.common.ServerboundResourcePackPacket;
+ import net.minecraft.network.protocol.cookie.ServerboundCookieResponsePacket;
+ import net.minecraft.server.MinecraftServer;
+ import net.minecraft.server.level.ClientInformation;
++import net.minecraft.server.level.ServerPlayer;
+ import net.minecraft.util.VisibleForDebug;
+ import net.minecraft.util.profiling.Profiler;
+ import org.slf4j.Logger;
+@@ -347,6 +348,18 @@ public abstract class ServerCommonPacketListenerImpl implements ServerCommonPack
+     }
+ 
+     public void send(Packet<?> packet) {
++        // 0011: Minimal thread guardrail for packet sending
++        if (io.multipaper.herculi.config.HerculiConfig.instance().guardrailsEnabled()) {
++            final ServerPlayer player = this instanceof ServerGamePacketListenerImpl ? 
++                ((ServerGamePacketListenerImpl) this).getPlayer() : null;
++            if (player != null && !ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(player)) {
++                // Log but don't crash - networking can be called from various threads
++                if (io.multipaper.herculi.config.HerculiConfig.instance().getBoolean("guardrails.networking.logOffThread", false)) {
++                    LOGGER.warn("Packet sent off-thread for player {}: {}", 
++                        player.getName().getString(), packet.getClass().getSimpleName());
++                }
++            }
++        }
+         this.send(packet, null);
+     }
+ 
+diff --git a/net/minecraft/server/network/ServerGamePacketListenerImpl.java b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
+index d6e96a191469c8b263031da18a2e519032dd79d7..bfc6c893272937151ca52f64dc3fea0a7528e21c 100644
+--- a/net/minecraft/server/network/ServerGamePacketListenerImpl.java
++++ b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
+@@ -314,6 +314,10 @@ public class ServerGamePacketListenerImpl
+     private final io.papermc.paper.event.packet.ClientTickEndEvent tickEndEvent; // Paper - add client tick end event
+     public final io.papermc.paper.connection.PaperPlayerGameConnection playerGameConnection; // Paper
+ 
++    // Herculi 0054 - ping deferral
++    private long herculiPendingPongTime = -1L;
++    private int herculiPingDelayTicks;
++
+     public ServerGamePacketListenerImpl(MinecraftServer server, Connection connection, ServerPlayer player, CommonListenerCookie cookie) {
+         super(server, connection, cookie);
+         this.chunkSender = new PlayerChunkSender(connection.isMemoryConnection());
+@@ -407,6 +411,15 @@ public class ServerGamePacketListenerImpl
+         this.dropSpamThrottler.tick();
+         this.tabSpamThrottler.tick(); // Paper - configurable tab spam limits
+         this.recipeSpamPackets.tick(); // Paper - auto recipe limit
++
++        // Herculi 0054 - process deferred ping response
++        if (this.herculiPingDelayTicks > 0) {
++            this.herculiPingDelayTicks--;
++            if (this.herculiPingDelayTicks == 0 && this.herculiPendingPongTime != -1L) {
++                this.connection.send(new ClientboundPongResponsePacket(this.herculiPendingPongTime));
++                this.herculiPendingPongTime = -1L;
++            }
++        }
+         if (this.player.getLastActionTime() > 0L
+             && this.server.getPlayerIdleTimeout() > 0
+             && Util.getMillis() - this.player.getLastActionTime() > this.server.getPlayerIdleTimeout() * 1000L * 60L && !this.player.wonGame) { // Paper - Prevent AFK kick while watching end credits
+@@ -2370,6 +2383,14 @@ public class ServerGamePacketListenerImpl
+     }
+ 
+     private void performUnsignedChatCommand(String command) {
++        // 0011: Minimal thread guardrail for command execution
++        if (io.multipaper.herculi.config.HerculiConfig.instance().guardrailsEnabled() && 
++            !ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(this.player)) {
++            if (io.multipaper.herculi.config.HerculiConfig.instance().getBoolean("guardrails.networking.logOffThread", false)) {
++                LOGGER.warn("Command executed off-thread for player {}: /{}", 
++                    this.player.getName().getString(), command);
++            }
++        }
+         // CraftBukkit start
+         String prefixedCommand = "/" + command;
+         if (org.spigotmc.SpigotConfig.logCommands) { // Paper - Add missing SpigotConfig logCommands check
+@@ -2816,6 +2837,18 @@ public class ServerGamePacketListenerImpl
+ 
+     @Override
+     public void handlePingRequest(ServerboundPingRequestPacket packet) {
++        // Herculi 0054 - defer ping if enabled
++        try {
++            final boolean defer = io.multipaper.herculi.config.HerculiConfig.instance().getBoolean("networking.ping.defer.enabled", false);
++            final int ticks = Math.max(0, io.multipaper.herculi.config.HerculiConfig.instance().getInt("networking.ping.defer.ticks", 1));
++            if (defer && ticks > 0) {
++                this.herculiPendingPongTime = packet.getTime();
++                // If a previous ping is in-flight, just overwrite; client will accept last reply
++                this.herculiPingDelayTicks = ticks;
++                try { io.papermc.paper.FeatureHooks.herculi_incPingDeferrals(ticks); } catch (Throwable ignored) {}
++                return;
++            }
++        } catch (Throwable ignored) {}
+         this.connection.send(new ClientboundPongResponsePacket(packet.getTime()));
+     }
+ 
+@@ -3727,6 +3760,7 @@ public class ServerGamePacketListenerImpl
+ 
+     @Override
+     public void disconnectAsync(final net.minecraft.network.DisconnectionDetails disconnectionInfo) {
++        // 0011: Ensure disconnect is properly scheduled to main thread
+         if (this.cserver.isPrimaryThread()) {
+             this.disconnect(disconnectionInfo);
+             return;
+diff --git a/net/minecraft/server/players/PlayerList.java b/net/minecraft/server/players/PlayerList.java
+index db56578bff06574337463c2421537f43d1a19189..60a0c92fc706810f85e6619fd3b3c370f9c9c655 100644
+--- a/net/minecraft/server/players/PlayerList.java
++++ b/net/minecraft/server/players/PlayerList.java
+@@ -92,6 +92,9 @@ import net.minecraft.world.level.storage.LevelData;
+ import net.minecraft.world.level.storage.LevelResource;
+ import net.minecraft.world.level.storage.PlayerDataStorage;
+ import net.minecraft.world.level.storage.TagValueInput;
++import net.minecraft.world.level.storage.TagValueOutput; // Herculi - async player save (0068)
++import net.minecraft.nbt.CompoundTag; // Herculi - async player save (0068)
++import java.util.concurrent.*; // Herculi - async player save (0068)
+ import net.minecraft.world.level.storage.ValueInput;
+ import net.minecraft.world.phys.Vec3;
+ import net.minecraft.world.scores.DisplaySlot;
+@@ -491,7 +494,29 @@ public abstract class PlayerList {
+     protected void save(ServerPlayer player) {
+         if (!player.getBukkitEntity().isPersistent()) return; // CraftBukkit
+         player.lastSave = MinecraftServer.currentTick; // Paper - Incremental chunk and player saving
+-        this.playerIo.save(player);
++        if (io.papermc.paper.FeatureHooks.herculi_isAsyncPlayerSaveEnabled()) { // Herculi - async player save (0068)
++            try (ProblemReporter.ScopedCollector scopedCollector = new ProblemReporter.ScopedCollector(player.problemPath(), LOGGER)) {
++                TagValueOutput tagValueOutput = TagValueOutput.createWithContext(scopedCollector, player.registryAccess());
++                player.saveWithoutId(tagValueOutput);
++                final CompoundTag compoundTag = tagValueOutput.buildResult();
++                final String stringUUID = player.getStringUUID();
++                final PlayerDataStorage storage = this.playerIo;
++                ensureHerculiPlayerSaveExecutor(io.papermc.paper.FeatureHooks.herculi_getAsyncPlayerSavePool());
++                HERCULI_PSAVE_EXECUTOR.execute(() -> {
++                    final long start = System.nanoTime();
++                    try {
++                        storage.saveTag(stringUUID, compoundTag);
++                    } finally {
++                        final long micros = (System.nanoTime() - start) / 1_000L;
++                        try { io.papermc.paper.FeatureHooks.herculi_recordPlayerSaveIoMicros(micros); } catch (Throwable ignored) {}
++                    }
++                });
++            } catch (Throwable t) {
++                LOGGER.warn("Failed to asynchronously prepare player data for {}", player.getScoreboardName(), t);
++            }
++        } else {
++            this.playerIo.save(player);
++        }
+         ServerStatsCounter serverStatsCounter = player.getStats(); // CraftBukkit
+         if (serverStatsCounter != null) {
+             serverStatsCounter.save();
+@@ -869,6 +894,10 @@ public abstract class PlayerList {
+             // CraftBukkit end
+             this.sendAllPlayerInfoIn = 0;
+         }
++        // Herculi 0067 - Drain broadcast queues on main thread with a per-tick budget
++        try {
++            io.multipaper.herculi.broadcast.BroadcastRegistry.drainOnMainTick(this.server);
++        } catch (Throwable ignored) {}
+     }
+ 
+     // CraftBukkit start - add a world/entity limited version
+@@ -1439,4 +1468,31 @@ public abstract class PlayerList {
+     public boolean isAllowCommandsForAllPlayers() {
+         return this.allowCommandsForAllPlayers;
+     }
++
++    // Herculi - async player save (0068)
++    private static volatile java.util.concurrent.ThreadPoolExecutor HERCULI_PSAVE_EXECUTOR;
++    private static void ensureHerculiPlayerSaveExecutor(final int poolSize) {
++        java.util.concurrent.ThreadPoolExecutor exec = HERCULI_PSAVE_EXECUTOR;
++        if (exec == null || exec.getCorePoolSize() != poolSize) {
++            java.util.concurrent.ThreadFactory tf = new java.util.concurrent.ThreadFactory() {
++                private final java.util.concurrent.ThreadFactory backing = java.util.concurrent.Executors.defaultThreadFactory();
++                private final java.util.concurrent.atomic.AtomicInteger idx = new java.util.concurrent.atomic.AtomicInteger();
++                @Override public Thread newThread(Runnable r) {
++                    Thread t = backing.newThread(r);
++                    t.setName("Herculi-psave-" + idx.incrementAndGet());
++                    t.setDaemon(true);
++                    return t;
++                }
++            };
++            java.util.concurrent.ThreadPoolExecutor replacement = new java.util.concurrent.ThreadPoolExecutor(
++                poolSize, poolSize, 60L, java.util.concurrent.TimeUnit.SECONDS,
++                new java.util.concurrent.LinkedBlockingQueue<>(), tf, new java.util.concurrent.ThreadPoolExecutor.DiscardPolicy());
++            replacement.allowCoreThreadTimeOut(true);
++            java.util.concurrent.ThreadPoolExecutor old = HERCULI_PSAVE_EXECUTOR;
++            HERCULI_PSAVE_EXECUTOR = replacement;
++            if (old != null) {
++                old.shutdown();
++            }
++        }
++    }
+ }
+diff --git a/net/minecraft/server/waypoints/ServerWaypointManager.java b/net/minecraft/server/waypoints/ServerWaypointManager.java
+index f9e7532f86122a379692561a639a209a126e8bba..24a61a32226f0dd3739e72da9f64badcb8e02813 100644
+--- a/net/minecraft/server/waypoints/ServerWaypointManager.java
++++ b/net/minecraft/server/waypoints/ServerWaypointManager.java
+@@ -16,12 +16,15 @@ import net.minecraft.world.waypoints.WaypointManager;
+ import net.minecraft.world.waypoints.WaypointTransmitter;
+ 
+ public class ServerWaypointManager implements WaypointManager<WaypointTransmitter> {
++    // Herculi: Hard-disable waypoint system for performance
++    private static final boolean DISABLED = true;
+     private final Set<WaypointTransmitter> waypoints = new HashSet<>();
+     private final Set<ServerPlayer> players = new HashSet<>();
+     private final Table<ServerPlayer, WaypointTransmitter, WaypointTransmitter.Connection> connections = HashBasedTable.create();
+ 
+     @Override
+     public void trackWaypoint(WaypointTransmitter waypoint) {
++        if (DISABLED) return; // Herculi
+         this.waypoints.add(waypoint);
+ 
+         for (ServerPlayer serverPlayer : this.players) {
+@@ -31,6 +34,7 @@ public class ServerWaypointManager implements WaypointManager<WaypointTransmitte
+ 
+     @Override
+     public void updateWaypoint(WaypointTransmitter waypoint) {
++        if (DISABLED) return; // Herculi
+         if (this.waypoints.contains(waypoint)) {
+             Map<ServerPlayer, WaypointTransmitter.Connection> map = Tables.transpose(this.connections).row(waypoint);
+             SetView<ServerPlayer> set = Sets.difference(this.players, map.keySet());
+@@ -47,12 +51,14 @@ public class ServerWaypointManager implements WaypointManager<WaypointTransmitte
+ 
+     @Override
+     public void untrackWaypoint(WaypointTransmitter waypoint) {
++        if (DISABLED) return; // Herculi
+         this.connections.column(waypoint).forEach((serverPlayer, connection) -> connection.disconnect());
+         Tables.transpose(this.connections).row(waypoint).clear();
+         this.waypoints.remove(waypoint);
+     }
+ 
+     public void addPlayer(ServerPlayer player) {
++        if (DISABLED) return; // Herculi
+         this.players.add(player);
+ 
+         for (WaypointTransmitter waypointTransmitter : this.waypoints) {
+@@ -65,6 +71,7 @@ public class ServerWaypointManager implements WaypointManager<WaypointTransmitte
+     }
+ 
+     public void updatePlayer(ServerPlayer player) {
++        if (DISABLED) return; // Herculi
+         Map<WaypointTransmitter, WaypointTransmitter.Connection> map = this.connections.row(player);
+         SetView<WaypointTransmitter> set = Sets.difference(this.waypoints, map.keySet());
+ 
+@@ -78,6 +85,7 @@ public class ServerWaypointManager implements WaypointManager<WaypointTransmitte
+     }
+ 
+     public void removePlayer(ServerPlayer player) {
++        if (DISABLED) return; // Herculi
+         this.connections.row(player).values().removeIf(connection -> {
+             connection.disconnect();
+             return true;
+@@ -87,25 +95,30 @@ public class ServerWaypointManager implements WaypointManager<WaypointTransmitte
+     }
+ 
+     public void breakAllConnections() {
++        if (DISABLED) return; // Herculi
+         this.connections.values().forEach(WaypointTransmitter.Connection::disconnect);
+         this.connections.clear();
+     }
+ 
+     public void remakeConnections(WaypointTransmitter waypoint) {
++        if (DISABLED) return; // Herculi
+         for (ServerPlayer serverPlayer : this.players) {
+             this.createConnection(serverPlayer, waypoint);
+         }
+     }
+ 
+     public Set<WaypointTransmitter> transmitters() {
++        if (DISABLED) return java.util.Collections.emptySet(); // Herculi
+         return this.waypoints;
+     }
+ 
+     private static boolean isLocatorBarEnabledFor(ServerPlayer player) {
++        if (DISABLED) return false; // Herculi
+         return player.level().getGameRules().getBoolean(GameRules.RULE_LOCATOR_BAR); // Paper - per world gamerules
+     }
+ 
+     private void createConnection(ServerPlayer player, WaypointTransmitter waypoint) {
++        if (DISABLED) return; // Herculi
+         if (player != waypoint) {
+             if (isLocatorBarEnabledFor(player)) {
+                 waypoint.makeWaypointConnectionWith(player).ifPresentOrElse(connection -> {
+@@ -122,6 +135,7 @@ public class ServerWaypointManager implements WaypointManager<WaypointTransmitte
+     }
+ 
+     private void updateConnection(ServerPlayer player, WaypointTransmitter waypoint, WaypointTransmitter.Connection connection) {
++        if (DISABLED) return; // Herculi
+         if (player != waypoint) {
+             if (isLocatorBarEnabledFor(player)) {
+                 if (!connection.isBroken()) {
+diff --git a/net/minecraft/world/entity/Entity.java b/net/minecraft/world/entity/Entity.java
+index 3bf9c9af6974189f5a192fade10baa96111f03e5..b412bcd7bc66d09f9eb00a9dad221d0293fc158b 100644
+--- a/net/minecraft/world/entity/Entity.java
++++ b/net/minecraft/world/entity/Entity.java
+@@ -1134,6 +1134,41 @@ public abstract class Entity implements SyncedDataHolder, Nameable, EntityAccess
+             this.moveStartZ = this.getZ();
+             this.moveVector = movement;
+         }
++        // Herculi 0055: Region boundary logging and optional enforcement
++        try {
++            final boolean log = io.multipaper.herculi.config.HerculiConfig.instance().getBoolean("regions.boundary.log", true);
++            final boolean enforce = io.multipaper.herculi.config.HerculiConfig.instance().getBoolean("regions.boundary.enforce.enabled", false);
++            if (log || enforce) {
++                net.minecraft.core.BlockPos currPos = net.minecraft.core.BlockPos.containing(this.getX(), this.getY(), this.getZ());
++                io.multipaper.herculi.region.RegionPos src = io.multipaper.herculi.region.RegionPos.forBlock(currPos);
++                net.minecraft.core.BlockPos nextPos = net.minecraft.core.BlockPos.containing(this.getX() + movement.x, this.getY() + movement.y, this.getZ() + movement.z);
++                io.multipaper.herculi.region.RegionPos dst = io.multipaper.herculi.region.RegionPos.forBlock(nextPos);
++                if (src.rx != dst.rx || src.rz != dst.rz) {
++                    io.multipaper.herculi.instrumentation.HerculiInstrumentation.instance().incRegionBoundaryCrossings();
++                    if (log) {
++                        org.bukkit.Bukkit.getLogger().fine("Entity " + this.getStringUUID() + " crossing region " + src + " -> " + dst + " type=" + this.getType().toString());
++                    }
++                    if (enforce) {
++                        io.multipaper.herculi.instrumentation.HerculiInstrumentation.instance().incRegionBoundaryClamped();
++                        final int shift = Math.max(0, io.multipaper.herculi.config.HerculiConfig.instance().threadingRegionShift());
++                        final int regionChunkSize = 1 << shift;
++                        final int regionBlockSize = regionChunkSize << 4;
++                        final int currChunkX = currPos.getX() >> 4;
++                        final int currChunkZ = currPos.getZ() >> 4;
++                        final int regionMinChunkX = (currChunkX >> shift) << shift;
++                        final int regionMinChunkZ = (currChunkZ >> shift) << shift;
++                        final int minX = regionMinChunkX << 4;
++                        final int minZ = regionMinChunkZ << 4;
++                        final int maxX = minX + regionBlockSize - 1;
++                        final int maxZ = minZ + regionBlockSize - 1;
++                        double targetX = net.minecraft.util.Mth.clamp(this.getX() + movement.x, minX + 0.001, maxX - 0.001);
++                        double targetZ = net.minecraft.util.Mth.clamp(this.getZ() + movement.z, minZ + 0.001, maxZ - 0.001);
++                        double targetY = this.getY() + movement.y;
++                        movement = new net.minecraft.world.phys.Vec3(targetX - this.getX(), targetY - this.getY(), targetZ - this.getZ());
++                    }
++                }
++            }
++        } catch (Throwable ignored) {}
+         try {
+         // Paper end - detailed watchdog information
+         if (this.noPhysics) {
+@@ -1518,6 +1553,10 @@ public abstract class Entity implements SyncedDataHolder, Nameable, EntityAccess
+     }
+ 
+     // Paper start - optimise collisions
++    // 0063: Thread-local collision list pools to reduce allocations
++    private static final ThreadLocal<List<VoxelShape>> COLLISION_VOXEL_POOL = ThreadLocal.withInitial(() -> new ArrayList<>(16));
++    private static final ThreadLocal<List<AABB>> COLLISION_AABB_POOL = ThreadLocal.withInitial(() -> new ArrayList<>(16));
++    
+     private Vec3 collide(Vec3 movement) {
+         final boolean xZero = movement.x == 0.0;
+         final boolean yZero = movement.y == 0.0;
+@@ -1528,8 +1567,10 @@ public abstract class Entity implements SyncedDataHolder, Nameable, EntityAccess
+ 
+         final AABB currentBox = this.getBoundingBox();
+ 
+-        final List<VoxelShape> potentialCollisionsVoxel = new ArrayList<>();
+-        final List<AABB> potentialCollisionsBB = new ArrayList<>();
++        final List<VoxelShape> potentialCollisionsVoxel = COLLISION_VOXEL_POOL.get();
++        final List<AABB> potentialCollisionsBB = COLLISION_AABB_POOL.get();
++        potentialCollisionsVoxel.clear();
++        potentialCollisionsBB.clear();
+ 
+         final AABB initialCollisionBox;
+         if (xZero & zZero) {
+@@ -1541,7 +1582,7 @@ public abstract class Entity implements SyncedDataHolder, Nameable, EntityAccess
+             initialCollisionBox = currentBox.expandTowards(movement);
+         }
+ 
+-        final List<AABB> entityAABBs = new ArrayList<>();
++        final List<AABB> entityAABBs = potentialCollisionsBB; // Reuse the same list
+         ca.spottedleaf.moonrise.patches.collisions.CollisionUtil.getEntityHardCollisions(
+             this.level, (Entity)(Object)this, initialCollisionBox, entityAABBs, 0, null
+         );
+@@ -1571,7 +1612,7 @@ public abstract class Entity implements SyncedDataHolder, Nameable, EntityAccess
+             stepRetrievalBox = stepRetrievalBox.expandTowards(0.0, (double)-1.0E-5F, 0.0);
+         }
+ 
+-        final List<VoxelShape> stepVoxels = new ArrayList<>();
++        final List<VoxelShape> stepVoxels = potentialCollisionsVoxel; // Reuse the voxel list
+         final List<AABB> stepAABBs = entityAABBs;
+ 
+         ca.spottedleaf.moonrise.patches.collisions.CollisionUtil.getCollisionsForBlocksOrWorldBorder(
+@@ -4057,9 +4098,15 @@ public abstract class Entity implements SyncedDataHolder, Nameable, EntityAccess
+         return this;
+     }
+ 
++    // 0063: Reuse passenger list cache for cross-dimension teleports
+     private Entity teleportCrossDimension(ServerLevel oldLevel, ServerLevel newLevel, TeleportTransition teleportTransition) {
+         List<Entity> passengers = this.getPassengers();
+-        List<Entity> list = new ArrayList<>(passengers.size());
++        List<Entity> list = PASSENGER_CACHE.get();
++        list.clear();
++        // Ensure capacity if it's an ArrayList
++        if (list instanceof ArrayList<Entity> arrayList) {
++            arrayList.ensureCapacity(passengers.size());
++        }
+         this.ejectPassengers();
+ 
+         for (Entity entity : passengers) {
+@@ -4586,9 +4633,13 @@ public abstract class Entity implements SyncedDataHolder, Nameable, EntityAccess
+         return Stream.concat(this.passengers.stream().flatMap(Entity::getPassengersAndSelf), Stream.of(this));
+     }
+ 
++    // 0063: Cache for indirect passengers to avoid repeated allocations
++    private static final ThreadLocal<List<Entity>> PASSENGER_CACHE = ThreadLocal.withInitial(() -> new ArrayList<>(8));
++    
+     public Iterable<Entity> getIndirectPassengers() {
+         // Paper start - optimise entity tracker
+-        final List<Entity> ret = new ArrayList<>();
++        final List<Entity> ret = PASSENGER_CACHE.get();
++        ret.clear();
+ 
+         if (this.passengers.isEmpty()) {
+             return ret;
+diff --git a/net/minecraft/world/entity/projectile/FireworkRocketEntity.java b/net/minecraft/world/entity/projectile/FireworkRocketEntity.java
+index d8dc196ef92e97f831cf97cd1536a46f81f9d5d1..337b1b428224bfbb7c21ac68924d6a84a56f9cbe 100644
+--- a/net/minecraft/world/entity/projectile/FireworkRocketEntity.java
++++ b/net/minecraft/world/entity/projectile/FireworkRocketEntity.java
+@@ -125,6 +125,31 @@ public class FireworkRocketEntity extends Projectile implements ItemSupplier {
+     @Override
+     public void tick() {
+         super.tick();
++        // Herculi 0050: cleanup rockets if the spawning/attached entity is gone or in a different world
++        try {
++            final boolean gateOwnerRemoved = io.multipaper.herculi.config.HerculiConfig.instance().getBoolean("fireworks.cleanup.on_owner_removed", true);
++            final boolean gateWorldMismatch = io.multipaper.herculi.config.HerculiConfig.instance().getBoolean("fireworks.cleanup.on_world_mismatch", true);
++            if ((gateOwnerRemoved || gateWorldMismatch) && this.level() instanceof ServerLevel srv) {
++                // Prefer attached entity if present
++                LivingEntity owner = this.attachedToEntity;
++                if (owner == null && this.spawningEntity != null) {
++                    Entity e = srv.getEntity(this.spawningEntity);
++                    if (e instanceof LivingEntity le) owner = le;
++                }
++                if (owner != null) {
++                    boolean removed = owner.isRemoved();
++                    boolean mismatch = owner.level() != this.level();
++                    if ((gateOwnerRemoved && removed) || (gateWorldMismatch && mismatch)) {
++                        this.discard(org.bukkit.event.entity.EntityRemoveEvent.Cause.DESPAWN);
++                        return;
++                    }
++                } else if (gateOwnerRemoved) {
++                    // no known owner and gateOwnerRemoved -> discard to avoid world-leaks
++                    this.discard(org.bukkit.event.entity.EntityRemoveEvent.Cause.DESPAWN);
++                    return;
++                }
++            }
++        } catch (Throwable ignored) {}
+         HitResult hitResultOnMoveVector;
+         if (this.isAttachedToEntity()) {
+             if (this.attachedToEntity == null) {
+diff --git a/net/minecraft/world/entity/raid/Raid.java b/net/minecraft/world/entity/raid/Raid.java
+index b3a29ce523fb5de71589c7c17598bba17622f988..488f78516b471954f1b053dea31deedf2df29fde 100644
+--- a/net/minecraft/world/entity/raid/Raid.java
++++ b/net/minecraft/world/entity/raid/Raid.java
+@@ -227,18 +227,20 @@ public class Raid {
+     }
+ 
+     private void updatePlayers(ServerLevel level) {
+-        Set<ServerPlayer> set = Sets.newHashSet(this.raidEvent.getPlayers());
+-        List<ServerPlayer> players = level.getPlayers(this.validPlayer());
+-
+-        for (ServerPlayer serverPlayer : players) {
+-            if (!set.contains(serverPlayer)) {
+-                this.raidEvent.addPlayer(serverPlayer);
++        // 0037: Avoid O(n*m) by using sets for membership tests
++        final Set<ServerPlayer> current = Sets.newHashSet(this.raidEvent.getPlayers());
++        final List<ServerPlayer> list = level.getPlayers(this.validPlayer());
++        final Set<ServerPlayer> online = new java.util.HashSet<>(list);
++
++        for (ServerPlayer p : list) {
++            if (!current.contains(p)) {
++                this.raidEvent.addPlayer(p);
+             }
+         }
+ 
+-        for (ServerPlayer serverPlayerx : set) {
+-            if (!players.contains(serverPlayerx)) {
+-                this.raidEvent.removePlayer(serverPlayerx);
++        for (ServerPlayer p : current) {
++            if (!online.contains(p)) {
++                this.raidEvent.removePlayer(p);
+             }
+         }
+     }
+diff --git a/net/minecraft/world/level/Level.java b/net/minecraft/world/level/Level.java
+index 51a99b0bf5ab8f594d0c49412add5ef1641badff..996ca8787fc9c60a7fa8c1cdc628fc6054c32a8b 100644
+--- a/net/minecraft/world/level/Level.java
++++ b/net/minecraft/world/level/Level.java
+@@ -132,6 +132,9 @@ public abstract class Level implements LevelAccessor, UUIDLookup<Entity>, AutoCl
+     private final RegistryAccess registryAccess;
+     private final DamageSources damageSources;
+     private long subTickCount;
++    // 0029: ThreadLocal buffers to reduce temporary allocations on hot paths
++    private static final ThreadLocal<java.util.ArrayList<net.minecraft.world.phys.AABB>> HERCULI_TL_AABBS = ThreadLocal.withInitial(() -> new java.util.ArrayList<>(128));
++    private static final ThreadLocal<java.util.ArrayList<net.minecraft.world.phys.shapes.VoxelShape>> HERCULI_TL_VOXELS = ThreadLocal.withInitial(() -> new java.util.ArrayList<>(128));
+ 
+     // CraftBukkit start
+     public final io.papermc.paper.antixray.ChunkPacketBlockController chunkPacketBlockController; // Paper - Anti-Xray
+@@ -585,8 +588,10 @@ public abstract class Level implements LevelAccessor, UUIDLookup<Entity>, AutoCl
+         // note: it is useless to look at shapes outside of range / 2.0
+         final AABB collectionVolume = boundsShape.bounds().inflate(expandByX, expandByY, expandByZ);
+ 
+-        final List<AABB> aabbs = new java.util.ArrayList<>();
+-        final List<VoxelShape> voxels = new java.util.ArrayList<>();
++        final java.util.ArrayList<AABB> aabbs = HERCULI_TL_AABBS.get();
++        final java.util.ArrayList<VoxelShape> voxels = HERCULI_TL_VOXELS.get();
++        aabbs.clear();
++        voxels.clear();
+ 
+         ca.spottedleaf.moonrise.patches.collisions.CollisionUtil.getCollisionsForBlocksOrWorldBorder(
+             (Level)(Object)this, entity, collectionVolume, voxels, aabbs,
+@@ -624,7 +629,9 @@ public abstract class Level implements LevelAccessor, UUIDLookup<Entity>, AutoCl
+         // can use unoptimized join here (instead of join()), as closestPointTo uses toAabbs()
+         final VoxelShape freeSpace = net.minecraft.world.phys.shapes.Shapes.joinUnoptimized(boundsShape, joined, net.minecraft.world.phys.shapes.BooleanOp.ONLY_FIRST);
+ 
+-        return freeSpace.closestPointTo(fromPosition);
++        java.util.Optional<net.minecraft.world.phys.Vec3> result = freeSpace.closestPointTo(fromPosition);
++        // do not clear ThreadLocals themselves, just contents already cleared above
++        return result;
+     }
+ 
+     /**
+diff --git a/net/minecraft/world/level/PotentialCalculator.java b/net/minecraft/world/level/PotentialCalculator.java
+index c9ff08679ba711bb86477ad39526cf9a41f5f315..ebe4e8224fc129ba1d7291928371cd46f337c255 100644
+--- a/net/minecraft/world/level/PotentialCalculator.java
++++ b/net/minecraft/world/level/PotentialCalculator.java
+@@ -6,10 +6,19 @@ import net.minecraft.core.BlockPos;
+ 
+ public class PotentialCalculator {
+     private final List<PotentialCalculator.PointCharge> charges = Lists.newArrayList();
++    // Herculi 0049: bounded cache per instance, keyed by BlockPos to cache the position-dependent potential factor (sum of point charges)
++    // Thread-safety: PotentialCalculator instances are used within a single tick/spawn calculation; avoid global state
++    // Cache invalidation: whenever charges are mutated, we bump modCount and wipe the cache lazily
++    private transient long[] cacheKeys; // pos.asLong()
++    private transient double[] cacheVals; // cached potential factor (without multiplying by 'charge' argument)
++    private transient int cacheMask; // size-1 for power-of-two sizing
++    private transient int cacheModCount; // snapshot of modCount at cache init
++    private int modCount;
+ 
+     public void addCharge(BlockPos pos, double charge) {
+         if (charge != 0.0) {
+             this.charges.add(new PotentialCalculator.PointCharge(pos, charge));
++            this.modCount++;
+         }
+     }
+ 
+@@ -17,14 +26,76 @@ public class PotentialCalculator {
+         if (charge == 0.0) {
+             return 0.0;
+         } else {
+-            double d = 0.0;
++            // Try cache
++            double factor = Double.NaN;
++            if (io.papermc.paper.PotentialHooks.isEnabled()) {
++                factor = this.cacheLookup(pos);
++            } else {
++                // ensure no accidental stale cache retention between toggles
++                this.cacheKeys = null; this.cacheVals = null; this.cacheMask = 0; this.cacheModCount = 0;
++            }
++            if (Double.isNaN(factor)) {
++                double sum = 0.0;
++                for (PotentialCalculator.PointCharge pointCharge : this.charges) {
++                    sum += pointCharge.getPotentialChange(pos);
++                }
++                factor = sum;
++                if (io.papermc.paper.PotentialHooks.isEnabled()) this.cacheStore(pos, factor);
++            }
++            return factor * charge;
++        }
++    }
+ 
+-            for (PotentialCalculator.PointCharge pointCharge : this.charges) {
+-                d += pointCharge.getPotentialChange(pos);
++    private double cacheLookup(final BlockPos pos) {
++        // init or invalidate cache if charges changed
++        if (this.cacheKeys == null || this.cacheVals == null || this.cacheMask == 0 || this.cacheModCount != this.modCount) {
++            final int size = Math.max(64, io.papermc.paper.PotentialHooks.cacheSize());
++            final int pow2 = Integer.highestOneBit(size);
++            final int alloc = pow2 > 0 ? pow2 : 64;
++            this.cacheKeys = new long[alloc];
++            this.cacheVals = new double[alloc];
++            this.cacheMask = alloc - 1;
++            this.cacheModCount = this.modCount;
++            // keys default to 0; but pos.asLong() can be 0 for (0,0,0); use special NaN value to mark empty slots by using Double.NaN in vals
++            for (int i = 0; i < alloc; i++) this.cacheVals[i] = Double.NaN;
++        }
++        final long key = pos.asLong();
++        int idx = mix((int)key ^ (int)(key >>> 32)) & this.cacheMask;
++        // linear probe up to 3 steps to reduce clustering
++        for (int step = 0; step < 3; step++, idx = (idx + 1) & this.cacheMask) {
++            if (!Double.isNaN(this.cacheVals[idx]) && this.cacheKeys[idx] == key) {
++                io.papermc.paper.PotentialHooks.incHit();
++                return this.cacheVals[idx];
+             }
++            if (Double.isNaN(this.cacheVals[idx])) break; // empty slot
++        }
++        io.papermc.paper.PotentialHooks.incMiss();
++        return Double.NaN;
++    }
+ 
+-            return d * charge;
++    private void cacheStore(final BlockPos pos, final double value) {
++        final long key = pos.asLong();
++        int idx = mix((int)key ^ (int)(key >>> 32)) & this.cacheMask;
++        for (int step = 0; step < 3; step++, idx = (idx + 1) & this.cacheMask) {
++            if (Double.isNaN(this.cacheVals[idx]) || this.cacheKeys[idx] == key) {
++                this.cacheKeys[idx] = key;
++                this.cacheVals[idx] = value;
++                return;
++            }
+         }
++        // fallback: overwrite primary slot
++        this.cacheKeys[idx] = key;
++        this.cacheVals[idx] = value;
++    }
++
++    private static int mix(int x) {
++        // Avalanching mix
++        x ^= (x >>> 16);
++        x *= 0x7feb352d;
++        x ^= (x >>> 15);
++        x *= 0x846ca68b;
++        x ^= (x >>> 16);
++        return x;
+     }
+ 
+     static class PointCharge {
+diff --git a/net/minecraft/world/level/block/EndPortalBlock.java b/net/minecraft/world/level/block/EndPortalBlock.java
+index 997831c2b916899da8518c1415233812e6ec16b8..9eccced94920007c6d86e94489fa9ea438b1f9d0 100644
+--- a/net/minecraft/world/level/block/EndPortalBlock.java
++++ b/net/minecraft/world/level/block/EndPortalBlock.java
+@@ -69,7 +69,14 @@ public class EndPortalBlock extends BaseEntityBlock implements Portal {
+             // Purpur end - Add EntityTeleportHinderedEvent
+             // CraftBukkit start - Entity in portal
+             org.bukkit.event.entity.EntityPortalEnterEvent event = new org.bukkit.event.entity.EntityPortalEnterEvent(entity.getBukkitEntity(), org.bukkit.craftbukkit.util.CraftLocation.toBukkit(pos, level), org.bukkit.PortalType.ENDER); // Paper - add portal type
+-            level.getCraftServer().getPluginManager().callEvent(event);
++            final net.minecraft.server.MinecraftServer srv = net.minecraft.server.MinecraftServer.getServer();
++            if (srv != null && !srv.isSameThread()) {
++                final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
++                srv.execute(() -> { try { event.callEvent(); } finally { latch.countDown(); } });
++                try { latch.await(); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
++            } else {
++                event.callEvent();
++            }
+             if (event.isCancelled()) return; // Paper - make cancellable
+             // CraftBukkit end
+             if (!level.isClientSide && level.dimension() == Level.END && entity instanceof ServerPlayer serverPlayer && !serverPlayer.seenCredits) {
+diff --git a/net/minecraft/world/level/block/RedStoneWireBlock.java b/net/minecraft/world/level/block/RedStoneWireBlock.java
+index 1943a6aad888647953e2d9dbbeedb0bd81c6f9df..4a6a79e4bb6346f1be6bf6f4fe92ad4a415e0c39 100644
+--- a/net/minecraft/world/level/block/RedStoneWireBlock.java
++++ b/net/minecraft/world/level/block/RedStoneWireBlock.java
+@@ -275,7 +275,8 @@ public class RedStoneWireBlock extends Block {
+      * Note: Added 'source' argument so as to help determine direction of information flow
+      */
+     private void updateSurroundingRedstone(Level worldIn, BlockPos pos, BlockState state, @Nullable Orientation orientation, boolean blockAdded) {
+-        if (worldIn.paperConfig().misc.redstoneImplementation == io.papermc.paper.configuration.WorldConfiguration.Misc.RedstoneImplementation.EIGENCRAFT) {
++        if (worldIn.paperConfig().misc.redstoneImplementation == io.papermc.paper.configuration.WorldConfiguration.Misc.RedstoneImplementation.EIGENCRAFT
++            || io.papermc.paper.FeatureHooks.herculi_isRedstoneTurboEnabled()) {
+             // since 24w33a the source pos is no longer given, but instead an Orientation parameter
+             // when this is not null, it can be used to find the source pos, which the turbo uses
+             // to find the direction of information flow
+@@ -284,6 +285,7 @@ public class RedStoneWireBlock extends Block {
+                 source = pos.relative(orientation.getFront().getOpposite());
+             }
+             turbo.updateSurroundingRedstone(worldIn, pos, state, source);
++            try { io.papermc.paper.FeatureHooks.herculi_incRedstoneWireTurboEvals(); } catch (Throwable ignored) {}
+             return;
+         }
+         updatePowerStrength(worldIn, pos, state, orientation, blockAdded);
+@@ -298,6 +300,7 @@ public class RedStoneWireBlock extends Block {
+      * not been relevant since 1.13, thus it has been greatly simplified.
+      */
+     public BlockState calculateCurrentChanges(Level level, BlockPos pos, BlockState state) {
++        try { io.papermc.paper.FeatureHooks.herculi_incRedstoneWireEvals(); } catch (Throwable ignored) {}
+         int oldPower = state.getValue(POWER);
+         int newPower = ((DefaultRedstoneWireEvaluator) evaluator).calculateTargetStrength(level, pos);
+         if (oldPower != newPower) {
+@@ -348,7 +351,8 @@ public class RedStoneWireBlock extends Block {
+     protected void onPlace(BlockState state, Level level, BlockPos pos, BlockState oldState, boolean isMoving) {
+         if (!oldState.is(state.getBlock()) && !level.isClientSide) {
+             // Paper start - optimize redstone - replace call to updatePowerStrength
+-            if (level.paperConfig().misc.redstoneImplementation == io.papermc.paper.configuration.WorldConfiguration.Misc.RedstoneImplementation.ALTERNATE_CURRENT) {
++            if (level.paperConfig().misc.redstoneImplementation == io.papermc.paper.configuration.WorldConfiguration.Misc.RedstoneImplementation.ALTERNATE_CURRENT
++                || io.papermc.paper.FeatureHooks.herculi_isRedstoneACEnabled()) {
+                 level.getWireHandler().onWireAdded(pos, state); // Alternate Current
+             } else {
+                 this.updateSurroundingRedstone(level, pos, state, null, true); // Vanilla/Eigencraft
+@@ -371,7 +375,8 @@ public class RedStoneWireBlock extends Block {
+             }
+ 
+             // Paper start - optimize redstone - replace call to updatePowerStrength
+-            if (level.paperConfig().misc.redstoneImplementation == io.papermc.paper.configuration.WorldConfiguration.Misc.RedstoneImplementation.ALTERNATE_CURRENT) {
++            if (level.paperConfig().misc.redstoneImplementation == io.papermc.paper.configuration.WorldConfiguration.Misc.RedstoneImplementation.ALTERNATE_CURRENT
++                || io.papermc.paper.FeatureHooks.herculi_isRedstoneACEnabled()) {
+                 level.getWireHandler().onWireRemoved(pos, state); // Alternate Current
+             } else {
+                 this.updateSurroundingRedstone(level, pos, state, null, false); // Vanilla/Eigencraft
+@@ -401,7 +406,8 @@ public class RedStoneWireBlock extends Block {
+         if (!level.isClientSide) {
+             // Paper start - optimize redstone (Alternate Current)
+             // Alternate Current handles breaking of redstone wires in the WireHandler.
+-            if (level.paperConfig().misc.redstoneImplementation == io.papermc.paper.configuration.WorldConfiguration.Misc.RedstoneImplementation.ALTERNATE_CURRENT) {
++            if (level.paperConfig().misc.redstoneImplementation == io.papermc.paper.configuration.WorldConfiguration.Misc.RedstoneImplementation.ALTERNATE_CURRENT
++                || io.papermc.paper.FeatureHooks.herculi_isRedstoneACEnabled()) {
+                 level.getWireHandler().onWireUpdated(pos, state, orientation);
+             } else
+                 // Paper end - optimize redstone (Alternate Current)
+diff --git a/net/minecraft/world/level/dimension/end/EndDragonFight.java b/net/minecraft/world/level/dimension/end/EndDragonFight.java
+index 7f9bd256da15da915db1c45099572d9eb3286166..83cff6f6cf38908b47fbe68195ed9c5da9a87040 100644
+--- a/net/minecraft/world/level/dimension/end/EndDragonFight.java
++++ b/net/minecraft/world/level/dimension/end/EndDragonFight.java
+@@ -384,7 +384,15 @@ public class EndDragonFight {
+             } else {
+                 eggEvent.setCancelled(true);
+             }
+-            if (eggEvent.callEvent()) {
++            final net.minecraft.server.MinecraftServer srv = net.minecraft.server.MinecraftServer.getServer();
++            if (srv != null && !srv.isSameThread()) {
++                final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
++                srv.execute(() -> { try { eggEvent.callEvent(); } finally { latch.countDown(); } });
++                try { latch.await(); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
++            } else {
++                eggEvent.callEvent();
++            }
++            if (!eggEvent.isCancelled()) {
+                 ((org.bukkit.craftbukkit.block.CraftBlockState) eggEvent.getNewState()).place(3);
+                 // Paper end - Add DragonEggFormEvent
+             }
+diff --git a/net/minecraft/world/level/portal/PortalForcer.java b/net/minecraft/world/level/portal/PortalForcer.java
+index b84d658bb06ab7b51cfc18d7405238554f65d2a5..d1fd8520fbc1b6221e57605635f0f846789c73db 100644
+--- a/net/minecraft/world/level/portal/PortalForcer.java
++++ b/net/minecraft/world/level/portal/PortalForcer.java
+@@ -45,10 +45,26 @@ public class PortalForcer {
+     }
+ 
+     public Optional<BlockPos> findClosestPortalPosition(BlockPos exitPos, WorldBorder worldBorder, int i) {
++        // 0030: Optionally stage portal search on region-affine executor
++        if (io.multipaper.herculi.config.HerculiConfig.instance().getBoolean("portals.routing_enabled", false)) {
++            // If already on tick thread for this region, run inline to avoid context switch
++            if (ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(this.level, exitPos.getX() >> 4, exitPos.getZ() >> 4)) {
++                return this.herculi$findClosestPortalPosition_inline(exitPos, worldBorder, i);
++            }
++            final java.util.concurrent.atomic.AtomicReference<Optional<BlockPos>> ref = new java.util.concurrent.atomic.AtomicReference<>();
++            final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
++            io.multipaper.herculi.threading.WorldRegionScheduler.execute(this.level, exitPos.getX(), exitPos.getZ(), () -> {
++                try { ref.set(this.herculi$findClosestPortalPosition_inline(exitPos, worldBorder, i)); } finally { latch.countDown(); }
++            });
++            try { latch.await(); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
++            return ref.get();
++        }
++        return this.herculi$findClosestPortalPosition_inline(exitPos, worldBorder, i);
++    }
++
++    // 0030: Extracted inline logic to support optional staging
++    private Optional<BlockPos> herculi$findClosestPortalPosition_inline(BlockPos exitPos, WorldBorder worldBorder, int i) {
+         PoiManager poiManager = this.level.getPoiManager();
+-        // int i = isNether ? 16 : 128;
+-        // CraftBukkit end
+-        // Paper start - optimise portals
+         java.util.List<PoiRecord> records = new java.util.ArrayList<>();
+         io.papermc.paper.util.PoiAccess.findClosestPoiDataRecords(
+             poiManager,
+@@ -57,29 +73,22 @@ public class PortalForcer {
+                 net.minecraft.world.level.chunk.ChunkAccess lowest = this.level.getChunk(pos.getX() >> 4, pos.getZ() >> 4, net.minecraft.world.level.chunk.status.ChunkStatus.EMPTY);
+                 if (!lowest.getPersistedStatus().isOrAfter(net.minecraft.world.level.chunk.status.ChunkStatus.FULL)
+                     && (lowest.getBelowZeroRetrogen() == null || !lowest.getBelowZeroRetrogen().targetStatus().isOrAfter(net.minecraft.world.level.chunk.status.ChunkStatus.SPAWN))) {
+-                    // why would we generate the chunk?
+                     return false;
+                 }
+-                if (!worldBorder.isWithinBounds(pos) || (this.level.getTypeKey() == net.minecraft.world.level.dimension.LevelStem.NETHER && this.level.paperConfig().environment.netherCeilingVoidDamageHeight.test(v -> pos.getY() >= v))) { // Paper - Configurable nether ceiling damage
++                if (!worldBorder.isWithinBounds(pos) || (this.level.getTypeKey() == net.minecraft.world.level.dimension.LevelStem.NETHER && this.level.paperConfig().environment.netherCeilingVoidDamageHeight.test(v -> pos.getY() >= v))) {
+                     return false;
+                 }
+                 return lowest.getBlockState(pos).hasProperty(BlockStateProperties.HORIZONTAL_AXIS);
+             },
+             exitPos, i, Double.MAX_VALUE, PoiManager.Occupancy.ANY, true, records
+         );
+-
+-        // this gets us most of the way there, but we bias towards lower y values.
+         BlockPos lowestPos = null;
+         for (PoiRecord record : records) {
+-            if (lowestPos == null) {
+-                lowestPos = record.getPos();
+-            } else if (lowestPos.getY() > record.getPos().getY()) {
++            if (lowestPos == null || lowestPos.getY() > record.getPos().getY()) {
+                 lowestPos = record.getPos();
+             }
+         }
+-        // now we're done
+         return Optional.ofNullable(lowestPos);
+-        // Paper end - optimise portals
+     }
+ 
+     public Optional<BlockUtil.FoundRectangle> createPortal(BlockPos pos, Direction.Axis axis) {
+@@ -88,6 +97,24 @@ public class PortalForcer {
+     }
+ 
+     public Optional<BlockUtil.FoundRectangle> createPortal(BlockPos pos, Direction.Axis axis, @javax.annotation.Nullable net.minecraft.world.entity.Entity entity, int createRadius) {
++        // 0030: Optionally stage portal creation scanning/building on region-affine executor
++        if (io.multipaper.herculi.config.HerculiConfig.instance().getBoolean("portals.routing_enabled", false)) {
++            if (ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(this.level, pos.getX() >> 4, pos.getZ() >> 4)) {
++                return this.herculi$createPortal_inline(pos, axis, entity, createRadius);
++            }
++            final java.util.concurrent.atomic.AtomicReference<Optional<BlockUtil.FoundRectangle>> ref = new java.util.concurrent.atomic.AtomicReference<>();
++            final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
++            io.multipaper.herculi.threading.WorldRegionScheduler.execute(this.level, pos.getX(), pos.getZ(), () -> {
++                try { ref.set(this.herculi$createPortal_inline(pos, axis, entity, createRadius)); } finally { latch.countDown(); }
++            });
++            try { latch.await(); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
++            return ref.get();
++        }
++        return this.herculi$createPortal_inline(pos, axis, entity, createRadius);
++    }
++
++    // 0030: Extracted inline logic for optional staging
++    private Optional<BlockUtil.FoundRectangle> herculi$createPortal_inline(BlockPos pos, Direction.Axis axis, @javax.annotation.Nullable net.minecraft.world.entity.Entity entity, int createRadius) {
+         // CraftBukkit end
+         Direction direction = Direction.get(Direction.AxisDirection.POSITIVE, axis);
+         double d = -1.0;
+diff --git a/net/minecraft/world/level/redstone/CollectingNeighborUpdater.java b/net/minecraft/world/level/redstone/CollectingNeighborUpdater.java
+index 028eae2f9a459b60e92f3344091083aa93b54485..32a2f0f11deac9e51509a536bcdac6025979dd38 100644
+--- a/net/minecraft/world/level/redstone/CollectingNeighborUpdater.java
++++ b/net/minecraft/world/level/redstone/CollectingNeighborUpdater.java
+@@ -50,6 +50,7 @@ public class CollectingNeighborUpdater implements NeighborUpdater {
+         boolean flag = this.count > 0;
+         boolean flag1 = this.maxChainedNeighborUpdates >= 0 && this.count >= this.maxChainedNeighborUpdates;
+         this.count++;
++        try { io.papermc.paper.FeatureHooks.herculi_incRedstoneNeighborEnqueues(); } catch (Throwable ignored) {}
+         if (!flag1) {
+             if (flag) {
+                 this.addedThisLayer.add(updates);
+@@ -122,6 +123,24 @@ public class CollectingNeighborUpdater implements NeighborUpdater {
+             Direction direction = NeighborUpdater.UPDATE_ORDER[this.idx++];
+             BlockPos blockPos = this.sourcePos.relative(direction);
+             BlockState blockState = level.getBlockState(blockPos);
++            // Herculi 0056: Guard cross-region neighbor updates (same-region-only)
++            try {
++                if (io.multipaper.herculi.config.HerculiConfig.instance().getBoolean("regions.actions.same_region_only.enabled", true)) {
++                    io.multipaper.herculi.region.RegionPos src = io.multipaper.herculi.region.RegionPos.forBlock(this.sourcePos);
++                    io.multipaper.herculi.region.RegionPos dst = io.multipaper.herculi.region.RegionPos.forBlock(blockPos);
++                    if (src.rx != dst.rx || src.rz != dst.rz) {
++                        io.multipaper.herculi.instrumentation.HerculiInstrumentation.instance().incRedstoneCrossRegionSkipped();
++                        if (io.multipaper.herculi.config.HerculiConfig.instance().getBoolean("regions.actions.same_region_only.log", false)) {
++                            org.bukkit.Bukkit.getLogger().fine("Skipping cross-region neighbor update from " + this.sourcePos + " to " + blockPos + " src=" + src + " dst=" + dst);
++                        }
++                        // skip this direction
++                        if (this.idx < NeighborUpdater.UPDATE_ORDER.length && NeighborUpdater.UPDATE_ORDER[this.idx] == this.skipDirection) {
++                            this.idx++;
++                        }
++                        return this.idx < NeighborUpdater.UPDATE_ORDER.length;
++                    }
++                }
++            } catch (Throwable ignored) {}
+             Orientation orientation = null;
+             if (level.enabledFeatures().contains(FeatureFlags.REDSTONE_EXPERIMENTS)) {
+                 if (this.orientation == null) {
+diff --git a/net/minecraft/world/level/storage/PlayerDataStorage.java b/net/minecraft/world/level/storage/PlayerDataStorage.java
+index fe44d8d17d2622b3d6021c11579af85ef96737bb..66b895df50e30aea8fb9889fb36f9f19de4c99d7 100644
+--- a/net/minecraft/world/level/storage/PlayerDataStorage.java
++++ b/net/minecraft/world/level/storage/PlayerDataStorage.java
+@@ -48,6 +48,21 @@ public class PlayerDataStorage {
+         }
+     }
+ 
++    // Herculi 0068 - async player save helper: write prebuilt tag to disk
++    public void saveTag(String playerStringUUID, CompoundTag compoundTag) {
++        if (org.spigotmc.SpigotConfig.disablePlayerDataSaving) return; // Spigot
++        try {
++            Path path = this.playerDir.toPath();
++            Path path1 = Files.createTempFile(path, playerStringUUID + "-", ".dat");
++            NbtIo.writeCompressed(compoundTag, path1);
++            Path path2 = path.resolve(playerStringUUID + ".dat");
++            Path path3 = path.resolve(playerStringUUID + ".dat_old");
++            Util.safeReplaceFile(path2, path1, path3);
++        } catch (Exception var11) {
++            LOGGER.warn("Failed to save player data for {}", playerStringUUID, var11);
++        }
++    }
++
+     private void backup(String name, String stringUuid, String suffix) { // CraftBukkit
+         Path path = this.playerDir.toPath();
+         Path path1 = path.resolve(stringUuid + suffix); // CraftBukkit
