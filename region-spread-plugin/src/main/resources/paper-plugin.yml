@@ -1,0 +1,12 @@
+name: Region-Spread-Plugin
+version: ${version}
+main: com.herculi.regionspread.RegionSpreadPlugin
+description: Distribute players across region grid for load separation
+author: Herculí
+api-version: ${apiversion}
+load: STARTUP
+folia-supported: true
+defaultPerm: FALSE
+permissions:
+  regionspread.command:
+    default: op

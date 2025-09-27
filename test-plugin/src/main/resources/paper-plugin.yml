@@ -5,6 +5,8 @@ description: Purpur Test Plugin
 author: PurpurMC
 api-version: ${apiversion}
 load: STARTUP
+# Declare Folia support for compatibility testing
+folia-supported: true
 #bootstrapper: org.purpurmc.testplugin.TestPluginBootstrap
 #loader: org.purpurmc.testplugin.TestPluginLoader
 defaultPerm: FALSE

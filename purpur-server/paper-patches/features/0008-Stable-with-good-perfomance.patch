@@ -1,0 +1,477 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Angel <achaparro@lifeisthegame.email>
+Date: Sat, 27 Sep 2025 11:55:44 -0500
+Subject: [PATCH] Stable with good perfomance
+
+
+diff --git a/src/main/java/io/multipaper/herculi/broadcast/BroadcastManager.java b/src/main/java/io/multipaper/herculi/broadcast/BroadcastManager.java
+index 3e5c899ad4d8ed27b55dda5f6af03a3d5749789f..8aa0c547277b34bac91b2df5a2294f5dfa899e2a 100644
+--- a/src/main/java/io/multipaper/herculi/broadcast/BroadcastManager.java
++++ b/src/main/java/io/multipaper/herculi/broadcast/BroadcastManager.java
+@@ -46,12 +46,14 @@ public final class BroadcastManager {
+ 
+     public void sendOrEnqueue(final ServerPlayer player, final Packet<?> packet, final String tag) {
+         if (!enabled()) {
+-            player.connection.send(packet);
++            // Bypass wrapper to avoid recursion into ServerCommonPacketListenerImpl.send()
++            player.connection.connection.send(packet, null, true);
+             return;
+         }
+         // Only queue section block updates for now; pass-through others
+         if (!(packet instanceof ClientboundSectionBlocksUpdatePacket)) {
+-            player.connection.send(packet);
++            // Bypass wrapper to avoid recursion (e.g., chunk-with-light, light-update)
++            player.connection.connection.send(packet, null, true);
+             return;
+         }
+         final Connection key = player.connection.connection;
+@@ -63,7 +65,9 @@ public final class BroadcastManager {
+         int budget = drainBudgetPerEnqueue();
+         Packet<?> p;
+         while (budget-- > 0 && (p = q.poll()) != null) {
+-            player.connection.send(p);
++            // Bypass ServerCommonPacketListenerImpl.send() to avoid re-entering enqueue logic
++            // Send directly through the underlying Connection
++            player.connection.connection.send(p, null, true);
+             drained.incrementAndGet();
+         }
+         // If queue still has items, it will be drained by subsequent enqueues; a periodic ticker can be added later.
+@@ -77,7 +81,8 @@ public final class BroadcastManager {
+         int b = Math.max(1, budget);
+         Packet<?> p;
+         while (b-- > 0 && (p = q.poll()) != null) {
+-            player.connection.send(p);
++            // Bypass wrapper to prevent recursion into BroadcastManager
++            player.connection.connection.send(p, null, true);
+             drained.incrementAndGet();
+         }
+         if (q.isEmpty()) perRecipientQueues.remove(key, q);
+@@ -100,7 +105,8 @@ public final class BroadcastManager {
+             int budget = Math.max(1, maxPerRecipient);
+             Packet<?> p;
+             while (budget-- > 0 && (p = q.poll()) != null) {
+-                player.connection.send(p);
++                // Bypass wrapper to prevent recursion into BroadcastManager
++                player.connection.connection.send(p, null, true);
+                 sent++;
+                 drained.incrementAndGet();
+             }
+diff --git a/src/main/java/io/multipaper/herculi/instrumentation/HerculiInstrumentation.java b/src/main/java/io/multipaper/herculi/instrumentation/HerculiInstrumentation.java
+index 8b92c612d6762af572e041b7eaf05f8500208d30..cc7729fe597ea2fc02770c3db1d63c717df185bb 100644
+--- a/src/main/java/io/multipaper/herculi/instrumentation/HerculiInstrumentation.java
++++ b/src/main/java/io/multipaper/herculi/instrumentation/HerculiInstrumentation.java
+@@ -12,6 +12,7 @@ public final class HerculiInstrumentation {
+     }
+ 
+     private final java.util.concurrent.atomic.AtomicLong regionPoolsCreated = new java.util.concurrent.atomic.AtomicLong();
++    private final java.util.concurrent.atomic.AtomicInteger regionThreadsConfigured = new java.util.concurrent.atomic.AtomicInteger();
+     private final java.util.concurrent.atomic.AtomicLong regionTasksEnqueued = new java.util.concurrent.atomic.AtomicLong();
+     private final java.util.concurrent.atomic.AtomicLong regionTasksExecuted = new java.util.concurrent.atomic.AtomicLong();
+     private final java.util.concurrent.atomic.AtomicLong regionBoundaryCrossings = new java.util.concurrent.atomic.AtomicLong();
+@@ -22,6 +23,7 @@ public final class HerculiInstrumentation {
+ 
+     // Increments
+     public void incRegionPoolCreated() { regionPoolsCreated.incrementAndGet(); }
++    public void setRegionThreadsConfigured(int threads) { regionThreadsConfigured.set(Math.max(0, threads)); }
+     public void incRegionTasksEnqueued() { regionTasksEnqueued.incrementAndGet(); }
+     public void incRegionTasksExecuted() { regionTasksExecuted.incrementAndGet(); }
+     public void incRegionBoundaryCrossings() { regionBoundaryCrossings.incrementAndGet(); }
+@@ -30,6 +32,7 @@ public final class HerculiInstrumentation {
+ 
+     // Snapshots
+     public long regionPoolsCreated() { return regionPoolsCreated.get(); }
++    public int regionThreadsConfigured() { return regionThreadsConfigured.get(); }
+     public long regionTasksEnqueued() { return regionTasksEnqueued.get(); }
+     public long regionTasksExecuted() { return regionTasksExecuted.get(); }
+     public long regionBoundaryCrossings() { return regionBoundaryCrossings.get(); }
+diff --git a/src/main/java/io/multipaper/herculi/threading/RegionSchedulers.java b/src/main/java/io/multipaper/herculi/threading/RegionSchedulers.java
+index 54f560b20f2d09b7a2f793f8657737845db2cee1..decfe4240e6f00965007e8212c6d7f6be018db0f 100644
+--- a/src/main/java/io/multipaper/herculi/threading/RegionSchedulers.java
++++ b/src/main/java/io/multipaper/herculi/threading/RegionSchedulers.java
+@@ -19,19 +19,72 @@ import java.util.logging.Logger;
+  * - For now, region tasks immediately bounce to main thread for Bukkit safety by default.
+  */
+ public final class RegionSchedulers {
+-    private static final class Holder {
+-        final ExecutorService executor;
++    private static final class SerialRegionExecutor implements Executor {
++        private final Executor pool;
++        private final java.util.Queue<Runnable> queue = new java.util.concurrent.ConcurrentLinkedQueue<>();
++        private volatile boolean running;
+         volatile long lastUsedMillis;
+-        Holder(ExecutorService ex, long ts) { this.executor = ex; this.lastUsedMillis = ts; }
++        SerialRegionExecutor(final Executor pool) { this.pool = pool; this.lastUsedMillis = System.currentTimeMillis(); }
++        @Override
++        public void execute(Runnable command) {
++            if (command == null) return;
++            queue.add(command);
++            schedule();
++        }
++        private void schedule() {
++            if (running) return;
++            synchronized (this) {
++                if (running) return;
++                running = true;
++            }
++            pool.execute(this::drain);
++        }
++        private void drain() {
++            try {
++                for (;;) {
++                    final Runnable r = queue.poll();
++                    if (r == null) break;
++                    try { r.run(); } catch (Throwable ignored) {}
++                }
++            } finally {
++                synchronized (this) {
++                    running = false;
++                    if (!queue.isEmpty()) {
++                        running = true;
++                        pool.execute(this::drain);
++                    }
++                }
++            }
++        }
+     }
+ 
+-    private static final ConcurrentMap<Long, Holder> EXECUTORS = new ConcurrentHashMap<>();
++    private static final ConcurrentMap<Long, SerialRegionExecutor> EXECUTORS = new ConcurrentHashMap<>();
++    private static volatile ExecutorService POOL;
+     private static final HerculiInstrumentation INST = HerculiInstrumentation.instance();
+     private static final java.util.concurrent.atomic.AtomicLong ENQUEUE_COUNT = new java.util.concurrent.atomic.AtomicLong();
+     private static final AtomicBoolean LOGGED_EARLY_BOUNCE = new AtomicBoolean(false);
++    // Debug counters per region (only used if threading.debug is true)
++    private static final ConcurrentMap<Long, java.util.concurrent.atomic.AtomicInteger> DEBUG_REGION_USES = new ConcurrentHashMap<>();
+ 
+     private RegionSchedulers() {}
+ 
++    // Initialize shared worker pool with configured size
++    static {
++        try {
++            final int configured = HerculiConfig.instance().threadingRegionPoolSize();
++            final int threads = Math.max(2, configured > 0 ? configured : Runtime.getRuntime().availableProcessors());
++            INST.setRegionThreadsConfigured(threads);
++            final ThreadFactory tf = r -> {
++                Thread t = new Thread(r);
++                t.setName("Herculi-RegionPool");
++                t.setDaemon(true);
++                return t;
++            };
++            POOL = Executors.newFixedThreadPool(threads, tf);
++            for (int i = 0; i < threads; i++) INST.incRegionPoolCreated();
++        } catch (Throwable ignored) {}
++    }
++
+     public static long regionKeyFor(Location loc) {
+         if (loc == null) return 0L;
+         final int shift = HerculiConfig.instance().threadingRegionShift();
+@@ -47,19 +100,8 @@ public final class RegionSchedulers {
+         return r;
+     }
+ 
+-    private static ExecutorService executorFor(long regionKey) {
+-        Holder h = EXECUTORS.computeIfAbsent(regionKey, k -> {
+-            ThreadFactory tf = r -> {
+-                Thread t = new Thread(r);
+-                t.setName("Herculi-RegionExecutor-" + k);
+-                t.setDaemon(true);
+-                return t;
+-            };
+-            ExecutorService ex = Executors.newSingleThreadExecutor(tf);
+-            INST.incRegionPoolCreated();
+-            return new Holder(ex, System.currentTimeMillis());
+-        });
+-        return h.executor;
++    private static SerialRegionExecutor executorFor(long regionKey) {
++        return EXECUTORS.computeIfAbsent(regionKey, k -> new SerialRegionExecutor(POOL));
+     }
+ 
+     /**
+@@ -93,14 +135,24 @@ public final class RegionSchedulers {
+         if (enq % Math.max(1, HerculiConfig.instance().threadingRegionExecutorCleanupEveryEnqueues()) == 0) {
+             sweepIdleExecutors();
+         }
+-        Holder holder = EXECUTORS.get(key);
++        // Optional debug: log first few uses per region
++        try {
++            if (HerculiConfig.instance().getBoolean("threading.debug", false)) {
++                final java.util.concurrent.atomic.AtomicInteger c = DEBUG_REGION_USES.computeIfAbsent(key, k -> new java.util.concurrent.atomic.AtomicInteger());
++                int n = c.get();
++                if (n < 3 && c.compareAndSet(n, n + 1)) { // log first 3 enqueues per region
++                    Logger.getLogger("Herculi").info("RegionSchedulers: enqueue in region key=" + key + " use=" + (n + 1));
++                }
++            }
++        } catch (Throwable ignored) {}
++        SerialRegionExecutor holder = EXECUTORS.get(key);
+         if (holder != null) holder.lastUsedMillis = System.currentTimeMillis();
+         executorFor(key).execute(() -> {
+             try {
+                 task.run();
+             } finally {
+                 INST.incRegionTasksExecuted();
+-                Holder h = EXECUTORS.get(key);
++                SerialRegionExecutor h = EXECUTORS.get(key);
+                 if (h != null) h.lastUsedMillis = System.currentTimeMillis();
+             }
+         });
+@@ -120,15 +172,37 @@ public final class RegionSchedulers {
+         });
+     }
+ 
++    /**
++     * Compute a value on the player's region thread, then consume it on the Bukkit main thread.
++     */
++    public static <T> void supplyForThenMain(Player player, java.util.function.Supplier<T> supplier, java.util.function.Consumer<T> consumer) {
++        Objects.requireNonNull(supplier, "supplier");
++        Objects.requireNonNull(consumer, "consumer");
++        executeFor(player, () -> {
++            final T result;
++            try {
++                result = supplier.get();
++            } catch (Throwable t) {
++                // Swallow and pass null to consumer to indicate failure
++                consumer.accept(null);
++                return;
++            }
++            Runnable deliver = () -> consumer.accept(result);
++            if (Bukkit.isPrimaryThread()) {
++                deliver.run();
++            } else {
++                Bukkit.getScheduler().runTask(Bukkit.getPluginManager().getPlugins()[0], deliver);
++            }
++        });
++    }
++
+     private static void sweepIdleExecutors() {
+         final long idleMillis = TimeUnit.MINUTES.toMillis(HerculiConfig.instance().threadingRegionExecutorIdleMinutes());
+         final long now = System.currentTimeMillis();
+-        for (Map.Entry<Long, Holder> e : EXECUTORS.entrySet()) {
+-            Holder h = e.getValue();
++        for (Map.Entry<Long, SerialRegionExecutor> e : EXECUTORS.entrySet()) {
++            SerialRegionExecutor h = e.getValue();
+             if (now - h.lastUsedMillis > idleMillis) {
+-                if (EXECUTORS.remove(e.getKey(), h)) {
+-                    try { h.executor.shutdown(); } catch (Throwable ignored) {}
+-                }
++                EXECUTORS.remove(e.getKey(), h);
+             }
+         }
+     }
+diff --git a/src/main/java/org/bukkit/craftbukkit/command/HerculiCommand.java b/src/main/java/org/bukkit/craftbukkit/command/HerculiCommand.java
+index 4a0b21ab10f1d652de8786f2926b2e225e8789de..9a34f5568c1209cf552fe430be58bf184e2c9650 100644
+--- a/src/main/java/org/bukkit/craftbukkit/command/HerculiCommand.java
++++ b/src/main/java/org/bukkit/craftbukkit/command/HerculiCommand.java
+@@ -8,13 +8,20 @@ import io.multipaper.herculi.instrumentation.HerculiInstrumentation;
+ import net.kyori.adventure.text.Component;
+ import net.kyori.adventure.text.format.NamedTextColor;
+ import net.kyori.adventure.text.format.TextDecoration;
++// Herculi - testing utilities
++import org.bukkit.Location;
++import org.bukkit.Particle;
++import org.bukkit.Sound;
++import org.bukkit.SoundCategory;
++import org.bukkit.World;
++import org.bukkit.entity.Player;
+ 
+ public final class HerculiCommand extends org.bukkit.command.defaults.BukkitCommand {
+ 
+     public HerculiCommand() {
+         super("herculi");
+         this.setDescription("Herculi diagnostics and profiling commands");
+-        this.setUsage("/herculi <profile|locks|queues|probe|reload|mpmap> [args]");
++        this.setUsage("/herculi <profile|locks|queues|probe|reload|mpmap|thread|sound|particle> [args]");
+         this.setPermission("herculi.command");
+     }
+     
+@@ -65,7 +72,16 @@ public final class HerculiCommand extends org.bukkit.command.defaults.BukkitComm
+                 .append(Component.text(" - Show visual region/chunk map", NamedTextColor.WHITE))
+                 .append(Component.text("\n• ", NamedTextColor.GRAY))
+                 .append(Component.text("reload", NamedTextColor.YELLOW))
+-                .append(Component.text(" - Reload Herculi configuration", NamedTextColor.WHITE));
++                .append(Component.text(" - Reload Herculi configuration", NamedTextColor.WHITE))
++                .append(Component.text("\n• ", NamedTextColor.GRAY))
++                .append(Component.text("thread", NamedTextColor.YELLOW))
++                .append(Component.text(" - Show thread/region status at your location", NamedTextColor.WHITE))
++                .append(Component.text("\n• ", NamedTextColor.GRAY))
++                .append(Component.text("sound", NamedTextColor.YELLOW))
++                .append(Component.text(" - Play a test sound to a player (exercises handoff)", NamedTextColor.WHITE))
++                .append(Component.text("\n• ", NamedTextColor.GRAY))
++                .append(Component.text("particle", NamedTextColor.YELLOW))
++                .append(Component.text(" - Spawn test particles around a player (exercises handoff)", NamedTextColor.WHITE));
+             sender.sendMessage(help);
+             return true;
+         }
+@@ -288,6 +304,12 @@ public final class HerculiCommand extends org.bukkit.command.defaults.BukkitComm
+                 return true;
+             case "mpmap":
+                 return handleMpmapCommand(sender, args);
++            case "thread":
++                return handleThreadCommand(sender, args);
++            case "sound":
++                return handleSoundCommand(sender, args);
++            case "particle":
++                return handleParticleCommand(sender, args);
+             default:
+                 sendErrorMessage(sender, "Unknown subcommand.");
+                 sendUsageMessage(sender, this.getUsage());
+@@ -378,11 +400,112 @@ public final class HerculiCommand extends org.bukkit.command.defaults.BukkitComm
+         return true;
+     }
+ 
++    private boolean handleThreadCommand(CommandSender sender, String[] args) {
++        try {
++            boolean global = org.bukkit.Bukkit.isGlobalTickThread();
++            Component base = Component.text("[Herculi] ", NamedTextColor.GOLD, TextDecoration.BOLD)
++                .append(Component.text("Thread Status", NamedTextColor.AQUA, TextDecoration.UNDERLINED))
++                .append(Component.text("\n• GlobalTickThread: ", NamedTextColor.YELLOW))
++                .append(Component.text(String.valueOf(global), global ? NamedTextColor.GREEN : NamedTextColor.RED));
++            if (sender instanceof Player) {
++                Player p = (Player) sender;
++                Location loc = p.getLocation();
++                boolean owned = org.bukkit.Bukkit.getServer().isOwnedByCurrentRegion(loc);
++                base = base
++                    .append(Component.text("\n• OwnedByCurrentRegion: ", NamedTextColor.YELLOW))
++                    .append(Component.text(String.valueOf(owned), owned ? NamedTextColor.GREEN : NamedTextColor.RED))
++                    .append(Component.text("\n• Chunk: ", NamedTextColor.YELLOW))
++                    .append(Component.text((loc.getBlockX() >> 4) + ", " + (loc.getBlockZ() >> 4), NamedTextColor.WHITE));
++            }
++            sender.sendMessage(base);
++        } catch (Throwable t) {
++            sendErrorMessage(sender, "Thread diagnostics unavailable: " + t.getClass().getSimpleName());
++        }
++        return true;
++    }
++
++    private boolean handleSoundCommand(CommandSender sender, String[] args) {
++        try {
++            Player target = null;
++            int idx = 1;
++            if (sender instanceof Player) {
++                target = (Player) sender;
++            }
++            if (args.length >= 2) {
++                Player p = org.bukkit.Bukkit.getPlayer(args[1]);
++                if (p != null) { target = p; idx = 2; }
++            }
++            if (target == null) {
++                sendUsageMessage(sender, "/herculi sound [player] [soundNameOrKey] [volume] [pitch]");
++                return true;
++            }
++            String soundKey = (args.length > idx) ? args[idx] : "entity.experience_orb.pickup";
++            float volume = (args.length > idx + 1) ? parseFloat(args[idx + 1], 1.0f) : 1.0f;
++            float pitch  = (args.length > idx + 2) ? parseFloat(args[idx + 2], 1.0f) : 1.0f;
++            Location loc = target.getLocation();
++            // Try enum first
++            boolean sent = false;
++            try {
++                Sound s = Sound.valueOf(soundKey.toUpperCase(java.util.Locale.ROOT));
++                target.playSound(loc, s, SoundCategory.MASTER, volume, pitch);
++                sent = true;
++            } catch (IllegalArgumentException ignored) {}
++            if (!sent) {
++                target.playSound(loc, soundKey, SoundCategory.MASTER, volume, pitch);
++            }
++            sendSuccessMessage(sender, "Played sound '" + soundKey + "' to " + target.getName() + ".");
++        } catch (Throwable t) {
++            sendErrorMessage(sender, "Sound test failed: " + t.getClass().getSimpleName());
++        }
++        return true;
++    }
++
++    private boolean handleParticleCommand(CommandSender sender, String[] args) {
++        try {
++            Player target = null;
++            int idx = 1;
++            if (sender instanceof Player) {
++                target = (Player) sender;
++            }
++            if (args.length >= 2) {
++                Player p = org.bukkit.Bukkit.getPlayer(args[1]);
++                if (p != null) { target = p; idx = 2; }
++            }
++            if (target == null) {
++                sendUsageMessage(sender, "/herculi particle [player] [particleName] [count]");
++                return true;
++            }
++            String partKey = (args.length > idx) ? args[idx] : "HEART";
++            int count = (args.length > idx + 1) ? parseInt(args[idx + 1], 20) : 20;
++            Particle particle;
++            try {
++                particle = Particle.valueOf(partKey.toUpperCase(java.util.Locale.ROOT));
++            } catch (IllegalArgumentException ex) {
++                sendErrorMessage(sender, "Unknown particle: " + partKey);
++                return true;
++            }
++            World world = target.getWorld();
++            Location loc = target.getLocation();
++            world.spawnParticle(particle, loc.getX(), loc.getY() + 1.0, loc.getZ(), count, 0.3, 0.6, 0.3, 0.01);
++            sendSuccessMessage(sender, "Spawned particles '" + particle.name() + "' around " + target.getName() + ".");
++        } catch (Throwable t) {
++            sendErrorMessage(sender, "Particle test failed: " + t.getClass().getSimpleName());
++        }
++        return true;
++    }
++
++    private static float parseFloat(String s, float def) {
++        try { return Float.parseFloat(s); } catch (Throwable ignored) { return def; }
++    }
++    private static int parseInt(String s, int def) {
++        try { return Integer.parseInt(s); } catch (Throwable ignored) { return def; }
++    }
++
+     @Override
+     public java.util.List<String> tabComplete(@NotNull CommandSender sender, @NotNull String alias, @NotNull String[] args) {
+         java.util.List<String> out = new java.util.ArrayList<>();
+         if (args.length == 1) {
+-            java.util.List<String> roots = java.util.Arrays.asList("profile", "locks", "queues", "probe", "reload", "mpmap");
++            java.util.List<String> roots = java.util.Arrays.asList("profile", "locks", "queues", "probe", "reload", "mpmap", "thread", "sound", "particle");
+             String p = args[0].toLowerCase();
+             for (String r : roots) if (r.startsWith(p)) out.add(r);
+             return out;
+@@ -405,7 +528,7 @@ public final class HerculiCommand extends org.bukkit.command.defaults.BukkitComm
+             for (String r : opts) if (r.startsWith(p)) out.add(r);
+             return out;
+         }
+-        if (args.length == 2 && args[0].equalsIgnoreCase("mpmap")) {
++        if (args.length == 2 && (args[0].equalsIgnoreCase("mpmap") || args[0].equalsIgnoreCase("sound") || args[0].equalsIgnoreCase("particle"))) {
+             // Tab complete player names
+             String p = args[1].toLowerCase();
+             for (org.bukkit.entity.Player player : org.bukkit.Bukkit.getOnlinePlayers()) {
+diff --git a/src/main/java/org/bukkit/craftbukkit/entity/CraftPlayer.java b/src/main/java/org/bukkit/craftbukkit/entity/CraftPlayer.java
+index d1f8b76b79b6bd3916e03dd0674790b0642132c8..4b40a4ad477e43936aaf5bc434d81b579b3c32fa 100644
+--- a/src/main/java/org/bukkit/craftbukkit/entity/CraftPlayer.java
++++ b/src/main/java/org/bukkit/craftbukkit/entity/CraftPlayer.java
+@@ -845,7 +845,15 @@ public class CraftPlayer extends CraftHumanEntity implements Player, PluginMessa
+         if (this.getHandle().connection == null) return;
+ 
+         ClientboundSoundPacket packet = new ClientboundSoundPacket(soundEffectHolder, categoryNMS, loc.getX(), loc.getY(), loc.getZ(), volume, pitch, seed);
+-        this.getHandle().connection.send(packet);
++        if (io.multipaper.herculi.config.HerculiConfig.instance().handoffSoundsEnabled()) {
++            io.multipaper.herculi.threading.RegionSchedulers.executeForThenMain(this, () -> {
++                if (this.getHandle().connection != null) {
++                    this.getHandle().connection.send(packet);
++                }
++            });
++        } else {
++            this.getHandle().connection.send(packet);
++        }
+     }
+ 
+     @Override
+@@ -891,7 +899,15 @@ public class CraftPlayer extends CraftHumanEntity implements Player, PluginMessa
+         if (!(entity instanceof CraftEntity craftEntity)) return;
+ 
+         ClientboundSoundEntityPacket packet = new ClientboundSoundEntityPacket(soundEffectHolder, categoryNMS, craftEntity.getHandle(), volume, pitch, seed);
+-        this.getHandle().connection.send(packet);
++        if (io.multipaper.herculi.config.HerculiConfig.instance().handoffSoundsEnabled()) {
++            io.multipaper.herculi.threading.RegionSchedulers.executeForThenMain(this, () -> {
++                if (this.getHandle().connection != null) {
++                    this.getHandle().connection.send(packet);
++                }
++            });
++        } else {
++            this.getHandle().connection.send(packet);
++        }
+     }
+ 
+     @Override

@@ -11,6 +11,7 @@ import org.bukkit.entity.Player;
 import org.bukkit.entity.Entity;
 import org.bukkit.event.Listener;
 import org.bukkit.event.EventHandler;
+import io.papermc.paper.threadedregions.RegionizedServerInitEvent;
 import org.bukkit.event.player.PlayerCommandPreprocessEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.plugin.java.JavaPlugin;
@@ -22,6 +23,17 @@ public class TestPlugin extends JavaPlugin implements Listener {
     @Override
     public void onEnable() {
         this.getServer().getPluginManager().registerEvents(this, this);
+        boolean folia = false;
+        try {
+            java.lang.reflect.Method m = this.getDescription().getClass().getMethod("isFoliaSupported");
+            Object v = m.invoke(this.getDescription());
+            if (v instanceof Boolean) folia = (Boolean) v;
+        } catch (Throwable ignored) {}
+        boolean global = false;
+        try {
+            global = Bukkit.isGlobalTickThread();
+        } catch (Throwable ignored) {}
+        getLogger().info("[Herculi-Test] Folia support declared: " + folia + "; GlobalTickThread now: " + global);
         getLogger().info("[Herculi-Test] Type /herculi_test to run async handoff tests (command intercepted by plugin).");
     }
 
@@ -68,6 +80,12 @@ public class TestPlugin extends JavaPlugin implements Listener {
     }
 
     @EventHandler
+    public void onRegionizedInit(RegionizedServerInitEvent event) {
+        // Should fire once before regions tick in parallel
+        getLogger().info("[Herculi-Test] RegionizedServerInitEvent fired; regions will begin ticking after this.");
+    }
+
+    @EventHandler
     public void onPlayerJoin(PlayerJoinEvent event) {
         event.getPlayer().sendMessage("[Herculi-Test] Type /herculi_test to run async handoff tests.");
     }
@@ -96,35 +114,69 @@ public class TestPlugin extends JavaPlugin implements Listener {
         }
         Location loc = world.getSpawnLocation();
         Entity target = world.getNearbyEntities(loc, 16, 16, 16).stream().findFirst().orElse(null);
+        // Choose a player recipient (prefer the sender if a player)
+        Player recipient = null;
+        if (sender instanceof Player) {
+            recipient = (Player) sender;
+        } else {
+            recipient = Bukkit.getOnlinePlayers().stream().findFirst().orElse(null);
+        }
+
+        // Show thread/region context to the tester
+        try {
+            boolean global = Bukkit.isGlobalTickThread();
+            sender.sendMessage("[Herculi-Test] GlobalTickThread=" + global);
+        } catch (Throwable ignored) {}
+        if (sender instanceof Player) {
+            try {
+                Player p = (Player) sender;
+                boolean owned = Bukkit.getServer().isOwnedByCurrentRegion(p.getLocation());
+                sender.sendMessage("[Herculi-Test] OwnedByCurrentRegion@you=" + owned + " chunk=" + (p.getLocation().getBlockX() >> 4) + "," + (p.getLocation().getBlockZ() >> 4));
+            } catch (Throwable ignored) {}
+        }
 
         sender.sendMessage("[Herculi-Test] Scheduling async particle/sound tests...");
 
+        final Player finalRecipient = recipient; // capture for lambda
         Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
 
-            // Particle test (off-main)
+            // Particle test (off-main) via Player API to exercise handoff
             try {
-                world.spawnParticle(Particle.CRIT, loc, 10, 0.3, 0.3, 0.3, 0.01);
-                sender.sendMessage("[Herculi-Test] Async particle spawn requested.");
+                if (finalRecipient != null) {
+                    finalRecipient.spawnParticle(Particle.CRIT, finalRecipient.getLocation().add(0, 1.0, 0), 10, 0.3, 0.3, 0.3, 0.01);
+                    sender.sendMessage("[Herculi-Test] Async particle spawn requested via Player API.");
+                } else {
+                    sender.sendMessage("[Herculi-Test] No player online to receive particles.");
+                }
             } catch (Throwable t) {
                 sender.sendMessage("[Herculi-Test] Particle test threw: " + t.getClass().getSimpleName());
             }
 
-            // Location sound test (off-main)
+            // Location sound test (off-main) via Player API
             try {
-                world.playSound(loc, Sound.BLOCK_ANVIL_LAND, SoundCategory.MASTER, 1.0f, 1.0f);
-                sender.sendMessage("[Herculi-Test] Async location sound requested.");
+                if (finalRecipient != null) {
+                    finalRecipient.playSound(finalRecipient.getLocation(), Sound.BLOCK_ANVIL_LAND, SoundCategory.MASTER, 1.0f, 1.0f);
+                    sender.sendMessage("[Herculi-Test] Async location sound requested via Player API.");
+                } else {
+                    sender.sendMessage("[Herculi-Test] No player online to receive location sound.");
+                }
             } catch (Throwable t) {
                 sender.sendMessage("[Herculi-Test] Location sound test threw: " + t.getClass().getSimpleName());
             }
 
-            // Entity sound test (off-main) if an entity is nearby (entity selected on main thread)
+            // Entity sound test (off-main) targeted to player location if entity existed
             try {
-                if (target != null) {
-                    long seed = ThreadLocalRandom.current().nextLong();
-                    world.playSound(target, Sound.ENTITY_COW_AMBIENT, SoundCategory.NEUTRAL, 1.0f, 1.0f, seed);
-                    sender.sendMessage("[Herculi-Test] Async entity sound requested for entity " + target.getUniqueId());
+                if (finalRecipient != null) {
+                    if (target != null) {
+                        long seed = ThreadLocalRandom.current().nextLong();
+                        // Use player API; seed ignored in this variant but keeps semantics close
+                        finalRecipient.playSound(target.getLocation(), Sound.ENTITY_COW_AMBIENT, SoundCategory.NEUTRAL, 1.0f, 1.0f);
+                        sender.sendMessage("[Herculi-Test] Async entity sound requested via Player API (entity=" + target.getUniqueId() + ").");
+                    } else {
+                        sender.sendMessage("[Herculi-Test] No nearby entity found for entity-sound test.");
+                    }
                 } else {
-                    sender.sendMessage("[Herculi-Test] No nearby entity found for entity-sound test.");
+                    sender.sendMessage("[Herculi-Test] No player online to receive entity sound.");
                 }
             } catch (Throwable t) {
                 sender.sendMessage("[Herculi-Test] Entity sound test threw: " + t.getClass().getSimpleName());

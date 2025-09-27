@@ -1,0 +1,269 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Angel <achaparro@lifeisthegame.email>
+Date: Sat, 27 Sep 2025 11:56:49 -0500
+Subject: [PATCH] Player movement chunk optimi
+
+
+diff --git a/net/minecraft/server/level/ChunkMap.java b/net/minecraft/server/level/ChunkMap.java
+index 7494b5c5ce620fb1125c83e9fac251630caa09de..a87ea042d376d39f57cc036d04b4eb753062a125 100644
+--- a/net/minecraft/server/level/ChunkMap.java
++++ b/net/minecraft/server/level/ChunkMap.java
+@@ -1168,23 +1168,34 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+             this.herculi$vanishVisibleCache.clear();
+ 
+             final ServerPlayer[] playersRaw = players.getRawDataUnchecked();
++            final int playersLen = players.size();
+ 
+-            for (int i = 0, len = players.size(); i < len; ++i) {
++            for (int i = 0, len = playersLen; i < len; ++i) {
+                 final ServerPlayer player = playersRaw[i];
+                 this.updatePlayer(player);
+             }
+ 
+             if (lastChunkUpdate != currChunkUpdate || lastTrackedChunk != chunk) {
+-                // need to purge any players possible not in the chunk list
++                // need to purge any players possibly not in the chunk list
+                 for (final ServerPlayerConnection conn : new java.util.ArrayList<>(this.seenBy)) {
+                     final ServerPlayer player = conn.getPlayer();
+-                    if (!players.contains(player)) {
++                    if (!this.herculi$listContains(playersRaw, playersLen, player)) {
+                         this.removePlayer(player);
+                     }
+                 }
+             }
+         }
+ 
++        // Fast identity-based contains for ReferenceList raw array without allocations
++        private boolean herculi$listContains(final ServerPlayer[] raw, final int len, final ServerPlayer target) {
++            for (int i = 0; i < len; ++i) {
++                if (raw[i] == target) {
++                    return true;
++                }
++            }
++            return false;
++        }
++
+         @Override
+         public final void moonrise$removeNonTickThreadPlayers() {
+             boolean foundToRemove = false;
+@@ -1256,15 +1267,18 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+         }
+ 
+         public void broadcast(Packet<?> packet) {
+-            for (ServerPlayerConnection serverPlayerConnection : this.seenBy) {
+-                serverPlayerConnection.send(packet);
++            final ServerPlayerConnection[] viewers = this.herculi$viewersArray;
++            for (int i = 0, len = viewers.length; i < len; ++i) {
++                viewers[i].send(packet);
+             }
+         }
+ 
+         public void broadcastIgnorePlayers(Packet<?> packet, List<UUID> ignoredPlayers) {
+-            for (ServerPlayerConnection serverPlayerConnection : this.seenBy) {
+-                if (!ignoredPlayers.contains(serverPlayerConnection.getPlayer().getUUID())) {
+-                    serverPlayerConnection.send(packet);
++            final ServerPlayerConnection[] viewers = this.herculi$viewersArray;
++            for (int i = 0, len = viewers.length; i < len; ++i) {
++                final ServerPlayerConnection c = viewers[i];
++                if (!ignoredPlayers.contains(c.getPlayer().getUUID())) {
++                    c.send(packet);
+                 }
+             }
+         }
+@@ -1277,7 +1291,7 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+         }
+ 
+         public void broadcastRemoved() {
+-            for (ServerPlayerConnection serverPlayerConnection : this.seenBy) {
++            for (ServerPlayerConnection serverPlayerConnection : this.herculi$getViewerSnapshot()) {
+                 this.serverEntity.removePairing(serverPlayerConnection.getPlayer());
+             }
+         }
+@@ -1285,6 +1299,7 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+         public void removePlayer(ServerPlayer player) {
+             org.spigotmc.AsyncCatcher.catchOp("player tracker clear"); // Spigot
+             if (this.seenBy.remove(player.connection)) {
++                this.herculi$rebuildViewersArray();
+                 this.serverEntity.removePairing(player);
+             }
+         }
+@@ -1317,7 +1332,9 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+                     // 0060: optional cached vanish visibility
+                     boolean visible = true;
+                     try {
+-                        if (io.multipaper.herculi.config.HerculiConfig.instance().getBoolean("entities.tracker.vanish.cache.enabled", true)) {
++                        final io.multipaper.herculi.config.HerculiConfig cfg_tracker = io.multipaper.herculi.config.HerculiConfig.instance();
++                        final boolean vanishCache = cfg_tracker.getBoolean("entities.tracker.vanish.cache.enabled", true);
++                        if (vanishCache) {
+                             java.util.UUID pid = player.getUUID();
+                             java.lang.Boolean cached = this.herculi$vanishVisibleCache.get(pid);
+                             if (cached == null) {
+@@ -1351,31 +1368,56 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+                     if (capToUse <= 0) {
+                         capToUse = io.papermc.paper.FeatureHooks.herculi_getTrackingCapGlobal();
+                     }
+-                    if (capToUse > 0 && this.seenBy.size() >= capToUse && !this.seenBy.contains(player.connection)) {
++                    final int currentSize = this.seenBy.size();
++                    final boolean alreadyViewer = this.seenBy.contains(player.connection);
++                    if (capToUse > 0 && currentSize >= capToUse && !alreadyViewer) {
+                         try { io.papermc.paper.FeatureHooks.herculi_incTrackingCapHits(); } catch (Throwable ignored) {}
+                         return; // skip adding due to heavy/global cap
+                     }
+ 
+                     // 0064: Global max-per-entity cap from herculi config
+-                    final int cap = Math.max(1, io.multipaper.herculi.config.HerculiConfig.instance().getInt("entities.tracker.max_per_entity", 512));
+-                    if (!this.seenBy.contains(player.connection) && this.seenBy.size() >= cap) {
+-                        if (io.multipaper.herculi.config.HerculiConfig.instance().getBoolean("entities.tracker.cap.log", true) && !herculi$loggedTrackerCap) {
++                    final io.multipaper.herculi.config.HerculiConfig cfg_tracker_cap = io.multipaper.herculi.config.HerculiConfig.instance();
++                    final int cap = Math.max(1, cfg_tracker_cap.getInt("entities.tracker.max_per_entity", 512));
++                    if (!alreadyViewer && currentSize >= cap) {
++                        if (cfg_tracker_cap.getBoolean("entities.tracker.cap.log", true) && !herculi$loggedTrackerCap) {
+                             herculi$loggedTrackerCap = true;
+                             org.bukkit.Bukkit.getLogger().warning("Tracker cap reached for entity " + this.entity.getStringUUID() + " type=" + this.entity.getType() + " cap=" + cap);
+                         }
+                         return; // do not add more viewers beyond cap
+                     }
+ 
+-                    if (this.seenBy.add(player.connection)) {
+-                        this.serverEntity.addPairing(player);
+-                        this.serverEntity.onPlayerAdd(); // Paper - fix desync when a player is added to the tracker
++                    if (!alreadyViewer && this.seenBy.add(player.connection)) {
++                        this.herculi$rebuildViewersArray();
++                        if (cfg_tracker_cap.handoffTrackerPacketsEnabled()) {
++                            // Execute in player's region and bounce to main for packet emission
++                            final org.bukkit.entity.Player bukkitPlayer = player.getBukkitEntity();
++                            io.multipaper.herculi.threading.RegionSchedulers.executeForThenMain(bukkitPlayer, () -> {
++                                this.serverEntity.addPairing(player);
++                                this.serverEntity.onPlayerAdd(); // Paper - fix desync when a player is added to the tracker
++                            });
++                        } else {
++                            this.serverEntity.addPairing(player);
++                            this.serverEntity.onPlayerAdd(); // Paper - fix desync when a player is added to the tracker
++                        }
+                     }
+                 } else if (this.seenBy.remove(player.connection)) {
++                    this.herculi$rebuildViewersArray();
+                     this.serverEntity.removePairing(player);
+                 }
+             }
+         }
+ 
++        // Rebuild volatile viewers array after any structural change to seenBy
++        private void herculi$rebuildViewersArray() {
++            // Use seq lock as a write fence for readers using snapshots elsewhere
++            final int stamp = this.herculiSeq.writeBegin();
++            try {
++                this.herculi$viewersArray = this.seenBy.toArray(new ServerPlayerConnection[0]);
++            } finally {
++                this.herculiSeq.writeEnd(stamp);
++            }
++        }
++
+         private int scaledRange(int trackingDistance) {
+             return ChunkMap.this.level.getServer().getScaledTrackingDistance(trackingDistance);
+         }
+diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
+index 88c90f99750dcba09f44bea5e8489b6bb4c9125f..cc0758713eddb95519e47e5f76d5ac3fd0768246 100644
+--- a/net/minecraft/server/level/ServerLevel.java
++++ b/net/minecraft/server/level/ServerLevel.java
+@@ -2193,7 +2193,15 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+         } else {
+             BlockPos blockPos = player.blockPosition();
+             if (blockPos.closerToCenterThan(new Vec3(posX, posY, posZ), longDistance ? 512.0 : 32.0)) {
+-                player.connection.send(packet);
++                if (io.multipaper.herculi.config.HerculiConfig.instance().handoffParticlesEnabled()) {
++                    // Execute in the player's region and bounce to main for the actual send
++                    final org.bukkit.entity.Player bukkitPlayer = player.getBukkitEntity();
++                    io.multipaper.herculi.threading.RegionSchedulers.executeForThenMain(bukkitPlayer, () -> {
++                        if (player.connection != null) player.connection.send(packet);
++                    });
++                } else {
++                    player.connection.send(packet);
++                }
+                 return true;
+             } else {
+                 return false;
+diff --git a/net/minecraft/server/network/ServerCommonPacketListenerImpl.java b/net/minecraft/server/network/ServerCommonPacketListenerImpl.java
+index ff097777e540e6763751ac7e9daa7cddc8425245..f84a3722659ce7ca6fe5ffd5295f263688b769d6 100644
+--- a/net/minecraft/server/network/ServerCommonPacketListenerImpl.java
++++ b/net/minecraft/server/network/ServerCommonPacketListenerImpl.java
+@@ -348,16 +348,32 @@ public abstract class ServerCommonPacketListenerImpl implements ServerCommonPack
+     }
+ 
+     public void send(Packet<?> packet) {
+-        // 0011: Minimal thread guardrail for packet sending
+-        if (io.multipaper.herculi.config.HerculiConfig.instance().guardrailsEnabled()) {
+-            final ServerPlayer player = this instanceof ServerGamePacketListenerImpl ? 
+-                ((ServerGamePacketListenerImpl) this).getPlayer() : null;
+-            if (player != null && !ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(player)) {
+-                // Log but don't crash - networking can be called from various threads
+-                if (io.multipaper.herculi.config.HerculiConfig.instance().getBoolean("guardrails.networking.logOffThread", false)) {
+-                    LOGGER.warn("Packet sent off-thread for player {}: {}", 
+-                        player.getName().getString(), packet.getClass().getSimpleName());
+-                }
++        // 0011: Minimal thread guardrail for packet sending (cache lookups locally)
++        final io.multipaper.herculi.config.HerculiConfig cfg = io.multipaper.herculi.config.HerculiConfig.instance();
++        final boolean guardrails = cfg.guardrailsEnabled();
++        final ServerPlayer player = this instanceof ServerGamePacketListenerImpl ? ((ServerGamePacketListenerImpl) this).getPlayer() : null;
++        if (guardrails && player != null && !ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(player)) {
++            // Log but don't crash - networking can be called from various threads
++            final boolean logOffThread = cfg.getBoolean("guardrails.networking.logOffThread", false);
++            if (logOffThread) {
++                LOGGER.warn("Packet sent off-thread for player {}: {}", player.getName().getString(), packet.getClass().getSimpleName());
++            }
++        }
++        // Broadcasting path: enqueue supported packets per-recipient when enabled
++        if (player != null && io.multipaper.herculi.broadcast.BroadcastManager.instance().enabled()) {
++            final io.multipaper.herculi.broadcast.BroadcastManager bm = io.multipaper.herculi.broadcast.BroadcastManager.instance();
++            if (packet instanceof net.minecraft.network.protocol.game.ClientboundSectionBlocksUpdatePacket) {
++                bm.sendOrEnqueue(player, packet, "section-blocks");
++                return;
++            }
++            if (packet instanceof net.minecraft.network.protocol.game.ClientboundLevelChunkWithLightPacket) {
++                bm.sendOrEnqueue(player, packet, "chunk-with-light");
++                return;
++            }
++            if (packet instanceof net.minecraft.network.protocol.game.ClientboundLightUpdatePacket ||
++                packet instanceof net.minecraft.network.protocol.game.ClientboundLightUpdatePacketData) {
++                bm.sendOrEnqueue(player, packet, "light-update");
++                return;
+             }
+         }
+         this.send(packet, null);
+@@ -378,6 +394,7 @@ public abstract class ServerCommonPacketListenerImpl implements ServerCommonPack
+         boolean flag = !this.suspendFlushingOnServerThread || !this.server.isSameThread();
+ 
+         try {
++            // Broadcasting path (variant that receives a listener): if we queued above in send(Packet), we won't reach here.
+             this.connection.send(packet, channelFutureListener, flag);
+         } catch (Throwable var7) {
+             CrashReport crashReport = CrashReport.forThrowable(var7, "Sending packet");
+diff --git a/net/minecraft/server/network/ServerGamePacketListenerImpl.java b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
+index bfc6c893272937151ca52f64dc3fea0a7528e21c..b03b02f313ee700714b5e3d6454f84bb3c6487bf 100644
+--- a/net/minecraft/server/network/ServerGamePacketListenerImpl.java
++++ b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
+@@ -2384,9 +2384,10 @@ public class ServerGamePacketListenerImpl
+ 
+     private void performUnsignedChatCommand(String command) {
+         // 0011: Minimal thread guardrail for command execution
+-        if (io.multipaper.herculi.config.HerculiConfig.instance().guardrailsEnabled() && 
++        final io.multipaper.herculi.config.HerculiConfig cfg_guard = io.multipaper.herculi.config.HerculiConfig.instance();
++        if (cfg_guard.guardrailsEnabled() && 
+             !ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(this.player)) {
+-            if (io.multipaper.herculi.config.HerculiConfig.instance().getBoolean("guardrails.networking.logOffThread", false)) {
++            if (cfg_guard.getBoolean("guardrails.networking.logOffThread", false)) {
+                 LOGGER.warn("Command executed off-thread for player {}: /{}", 
+                     this.player.getName().getString(), command);
+             }
+@@ -2839,8 +2840,9 @@ public class ServerGamePacketListenerImpl
+     public void handlePingRequest(ServerboundPingRequestPacket packet) {
+         // Herculi 0054 - defer ping if enabled
+         try {
+-            final boolean defer = io.multipaper.herculi.config.HerculiConfig.instance().getBoolean("networking.ping.defer.enabled", false);
+-            final int ticks = Math.max(0, io.multipaper.herculi.config.HerculiConfig.instance().getInt("networking.ping.defer.ticks", 1));
++            final io.multipaper.herculi.config.HerculiConfig cfg_ping = io.multipaper.herculi.config.HerculiConfig.instance();
++            final boolean defer = cfg_ping.getBoolean("networking.ping.defer.enabled", false);
++            final int ticks = Math.max(0, cfg_ping.getInt("networking.ping.defer.ticks", 1));
+             if (defer && ticks > 0) {
+                 this.herculiPendingPongTime = packet.getTime();
+                 // If a previous ping is in-flight, just overwrite; client will accept last reply

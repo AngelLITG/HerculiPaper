@@ -1,3 +1,13 @@
+// === Performance tasks from 800-mover test ===
+- TODO Performance: Reduce tracker churn in ChunkMap.TrackedEntity.updatePlayer
+  - Optimize seenBy structure (avoid Collections.newSetFromMap(ConcurrentHashMap) on main thread)
+  - Batch add/remove; minimize contains checks
+  - Goal: reduce time in ChunkMap.newTrackerTick/updatePlayer
+- DONE Performance: Cache HerculiConfig flags in hot paths (ChunkMap, ServerGamePacketListenerImpl)
+- TODO Performance: Wire packet send path to threaded broadcasting queues
+  - Ensure ServerCommonPacketListenerImpl/Connection send routes via queues when enabled
+  - Goal: shift packet enqueue/flush off main; non-zero activeQueues/enqueued in /herculi queues
+
 3) Async chunk IO + light pipeline
  - DONE Prefetch scaffold: HerculiChunkPipeline.prefetchChunk
  - DONE Wire minimal async read stage behind config gate
@@ -26,7 +36,6 @@
 10) 0032-End-Gateways.patch
  - DONE Portal & End Gateway parity
 11) 0033-Block-events.patch DONE
-14) 0063-Optimization-Parallelization.patch DONE
 17) 0011-Player.patch DONE
 21) 0015-mpmap-debug-command.patch
 24) 0018-Block-entities.patch
@@ -42,8 +51,7 @@
  - Primary call sites already using allocation-free iteration against ReferenceList
  - Acceptance: no CME observed; unchanged results
 33) 0034-Add-various-API-for-Folia-plugin-compatibility.patch
- - TODO Expose minimal APIs needed by common Folia-aware plugins; document thread rules
-  - Acceptance: compile/run key plugins without shim layers; no regressions
+ - DONE Expose minimal APIs needed by common Folia-aware plugins (isFoliaSupported, RegionizedServerInitEvent, isGlobalTickThread)
 34) 0035-allow-unsupported-plugins-to-modify-chunks-via-global-scheduler.patch
  - TODO Verify unsupported plugins via global scheduler coverage
   - Acceptance: Document current coverage (VanillaCommandWrapper/HerculiSync); add cases for common plugin actions touching chunks; ensure main-thread fallback.
@@ -55,14 +63,22 @@
  - TODO Thread-safe potential calculations; cache/snapshot where beneficial
 54) 0057-Fix-test-failures-and-add-null-safety-checks.patch
 55) 0058-Fix-EntityRemoveEventTest-by-adding-missing-Bukkit-remove-cause.patch
-63) 0067-BroadcastPacketEvent.patch DONE
 
- 
+
+// === New Tasks: Region handoffs & diagnostics ===
+- DONE Regionized emissions handoff
+ - Subtasks
+  - DONE Particles handoff: wrap CraftWorld/ServerLevel particle sends via RegionSchedulers.executeForThenMain (gate: threading.handoff.particles)
+  - DONE Tracker packets handoff: in ChunkMap.TrackedEntity.updatePlayer route initial pairing packets via RegionSchedulers.executeForThenMain (gate: threading.handoff.tracker_packets)
+  - DONE Broadcast drain tick: ensure PlayerList.tick drains BroadcastRegistry each tick and verify metrics exposure
+  - DONE RegionSchedulers debug: add first-use per-region debug logs when threading.debug is true
+
+// === Profiling/Diagnostics Commands ===
 - TODO Add profiling/diagnostics commands
   - Subtasks
     - DONE `/herculi profile start|stop` (record timings/JFR hooks)
     - DONE `/herculi locks` (dump contention snapshot)
-    - DONE `/herculi queues` (show region queues/back-pressure)
+    - DONE `/herculi queues` (show region queues/back pressure)
     - DONE Add tab-complete for `/herculi` (profile/locks/queues/reload)
 
 - WIP Craft marshalling refinement: for give/clear, marshal per-target player region when behavior toggles on
@@ -95,6 +111,7 @@ tasks-completed:
 6) Event dispatch guardrails DONE
 13) 0051-Bukkit-API-thread-checks.patch DONE
  - Guards added: CraftServer.dispatchCommand; CraftPlayer.performCommand/chat/kick*; CraftChunk.getHandle; CraftWorld.getChunkAt; CraftBlock.getNMS/getData/setBlockState/getType
+14) 0063-Optimization-Parallelization.patch DONE
 15) 0007-Thread-safe-random.patch DONE
  - LegacyRandomSource: setSeed uses atomic set + gaussian reset; next(int) uses CAS loop; no ThreadingDetector throw (mirrors ShreddedPaper intent)
 16) 0008-Thread-safe-NeigbhorUpdater.patch DONE
@@ -140,5 +157,9 @@ tasks-completed:
 61) 0065-Optimization-Cache-chunk-packets.patch DONE
 63) 0067-BroadcastPacketEvent.patch DONE
 64) 0068-Optimization-Write-player-saves-async.patch DONE
+65) 0034-Add-various-API-for-Folia-plugin-compatibility.patch DONE
+66) Add testing subcommands: thread, sound, particle DONE
 - Create Herculi server configuration file `herculi.yml` and wire feature gates DONE
  - DONE Auto-merge missing `herculi.yml` keys on startup/reload
+
+67) Performance: Cache HerculiConfig flags in hot paths (ChunkMap, ServerGamePacketListenerImpl) DONE
