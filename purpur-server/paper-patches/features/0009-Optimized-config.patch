@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Angel <achaparro@lifeisthegame.email>
+Date: Sun, 28 Sep 2025 12:22:36 -0500
+Subject: [PATCH] Optimized config
+
+
+diff --git a/src/main/java/io/multipaper/herculi/broadcast/BroadcastManager.java b/src/main/java/io/multipaper/herculi/broadcast/BroadcastManager.java
+index 8aa0c547277b34bac91b2df5a2294f5dfa899e2a..b963ed4668a0617a526c257a3b27d81898d98e0a 100644
+--- a/src/main/java/io/multipaper/herculi/broadcast/BroadcastManager.java
++++ b/src/main/java/io/multipaper/herculi/broadcast/BroadcastManager.java
+@@ -50,9 +50,12 @@ public final class BroadcastManager {
+             player.connection.connection.send(packet, null, true);
+             return;
+         }
+-        // Only queue section block updates for now; pass-through others
+-        if (!(packet instanceof ClientboundSectionBlocksUpdatePacket)) {
+-            // Bypass wrapper to avoid recursion (e.g., chunk-with-light, light-update)
++        // Queue supported packet types: section block updates, chunk-with-light, and light updates
++        if (!(packet instanceof ClientboundSectionBlocksUpdatePacket
++            || packet instanceof net.minecraft.network.protocol.game.ClientboundLevelChunkWithLightPacket
++            || packet instanceof net.minecraft.network.protocol.game.ClientboundLightUpdatePacket
++            || packet instanceof net.minecraft.network.protocol.game.ClientboundLightUpdatePacketData)) {
++            // Pass-through unsupported packets directly
+             player.connection.connection.send(packet, null, true);
+             return;
+         }
+diff --git a/src/main/java/io/multipaper/herculi/config/HerculiConfig.java b/src/main/java/io/multipaper/herculi/config/HerculiConfig.java
+index 73bca658b72222fc1d411b0bd12c02fc539b86f1..02b9e899f9c01b9c48269bcd0e2ec2e21f0f11b7 100644
+--- a/src/main/java/io/multipaper/herculi/config/HerculiConfig.java
++++ b/src/main/java/io/multipaper/herculi/config/HerculiConfig.java
+@@ -169,6 +169,7 @@ public final class HerculiConfig {
+                             + "threading.handoff.enabled: false\n"
+                             + "threading.handoff.sounds: false\n"
+                             + "threading.handoff.particles: false\n"
++                            + "threading.handoff.tracker_packets: false\n"
+                             + "threading.handoff.debug: false\n\n"
+                             + "# Level random tick read-only precompute (default-off)\n"
+                             + "threading.random_precompute.enabled: false\n\n"
+@@ -327,7 +328,7 @@ public final class HerculiConfig {
+     public int broadcastingThreadedMaxQueuesTotal() { return Math.max(1, getInt("broadcasting.threaded.maxQueuesTotal", 20000)); }
+     public int broadcastingThreadedMaxBatchesPerQueue() { return Math.max(1, getInt("broadcasting.threaded.maxBatchesPerQueue", 64)); }
+     public String broadcastingThreadedDropPolicyRaw() { return getString("broadcasting.threaded.dropPolicy", "coalesce"); }
+-    public int broadcastingThreadedDrainBudget() { return Math.max(1, getInt("broadcasting.threaded.drainIntervalMs", 2)); }
++    public int broadcastingThreadedDrainBudget() { return Math.max(1, getInt("broadcasting.threaded.perTickDrainBudget", 4)); }
+ 
+     // Pathfinding recalculation getters
+     public boolean pathfindingRecalcEnabled() { return getBoolean("pathfinding.recalc.enabled", false); }

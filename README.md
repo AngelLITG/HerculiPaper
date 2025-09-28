@@ -83,22 +83,28 @@ threading.region_shift: 4                  # 16x16 chunk regions
 
 #### 📡 Network Optimizations
 ```yaml
-networking.parallel_flush_enabled: true    # Parallel network flushing
-broadcasting.threaded.enabled: true        # Threaded packet broadcasting
-broadcasting.threaded.maxQueuesTotal: 50000 # Support 1000+ players
+networking.parallel_flush_enabled: true          # Parallel network flushing
+broadcasting.threaded.enabled: true              # Threaded packet broadcasting
+broadcasting.threaded.maxQueuesTotal: 50000      # Support 1000+ players
+broadcasting.threaded.perTickDrainBudget: 4      # Drain batches per tick
+broadcasting.threaded.dropPolicy: coalesce       # Drop/coalesce policy
+broadcasting.threaded.drainIntervalMs: 2         # Drain cadence (ms)
 ```
 
 #### 🎯 Performance Features
 ```yaml
-fairness.enabled: true                     # Resource fairness system
-portals.routing_enabled: true              # Async portal teleports
-player_saves.async_enabled: true           # Non-blocking player saves
+fairness.enabled: true                             # Resource fairness system
+portals.routing_enabled: true                      # Async portal teleports
+async.player_save.enabled: true                    # Non-blocking player saves
+async.player_save.pool_size: 2                     # Worker threads
+threading.chunk_io_enable: true                    # Async chunk I/O pipeline
+threading.chunk_io_max_inflight: 32                # Max parallel I/O
 ```
 
 #### 🔍 Monitoring
 ```yaml
-profiling.enabled: true                    # Built-in performance monitoring
-guardrails.enabled: true                   # Safety checks and warnings
+profiling.enabled: true                            # Built-in performance monitoring
+guardrails.enabled: true                           # Safety checks and warnings
 ```
 
 ### Configuration Philosophy
