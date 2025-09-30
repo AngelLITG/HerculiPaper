@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Angel <achaparro@lifeisthegame.email>
+Date: Tue, 30 Sep 2025 11:36:21 -0500
+Subject: [PATCH] async join
+
+
+diff --git a/src/main/java/io/multipaper/herculi/config/HerculiConfig.java b/src/main/java/io/multipaper/herculi/config/HerculiConfig.java
+index 02b9e899f9c01b9c48269bcd0e2ec2e21f0f11b7..b8d87a394b74958471495015968b83330a816e2c 100644
+--- a/src/main/java/io/multipaper/herculi/config/HerculiConfig.java
++++ b/src/main/java/io/multipaper/herculi/config/HerculiConfig.java
+@@ -153,6 +153,15 @@ public final class HerculiConfig {
+                             + "# Entity tracker caps\n"
+                             + "entities.tracker.max_per_entity: 512\n"
+                             + "entities.tracker.cap.log: true\n\n"
++                            + "# Spawn pressure controls (default-off)\n"
++                            + "spawning.mob_pressure.enabled: false\n"
++                            + "spawning.mob_pressure.per_category_limit_percent: 100\n"
++                            + "spawning.mob_pressure.max_groups_per_pos: 3\n"
++                            + "spawning.mob_pressure.max_attempts_per_group: 4\n\n"
++                            + "# Entity tracker packet coalescing (default-off)\n"
++                            + "entities.tracker.coalesce.enabled: false\n"
++                            + "entities.tracker.coalesce.farDistance: 96\n"
++                            + "entities.tracker.coalesce.interval: 3\n\n"
+                             + "# Vanish optimization\n"
+                             + "entities.tracker.vanish.cache.enabled: true\n\n"
+                             + "# Portals/teleportation routing\n"
+@@ -261,6 +270,7 @@ public final class HerculiConfig {
+         m.put("networking.fencing.debug", "false");
+         m.put("networking.ping.defer.enabled", "false");
+         m.put("networking.ping.defer.ticks", "1");
++        m.put("networking.async_join_protocol", "true"); // Herculi: Async protocol changes during join
+         m.put("async.player_save.enabled", "false");
+         m.put("async.player_save.pool_size", "1");
+         m.put("activation.check_immunities_interval", "20");
+@@ -279,6 +289,16 @@ public final class HerculiConfig {
+         m.put("regions.actions.same_region_only.log", "false");
+         m.put("entities.tracker.max_per_entity", "512");
+         m.put("entities.tracker.cap.log", "true");
++        m.put("entities.tracker.hysteresis.blocks", "24");
++        // Spawn pressure (default-off)
++        m.put("spawning.mob_pressure.enabled", "false");
++        m.put("spawning.mob_pressure.per_category_limit_percent", "100");
++        m.put("spawning.mob_pressure.max_groups_per_pos", "3");
++        m.put("spawning.mob_pressure.max_attempts_per_group", "4");
++        // Tracker packet coalescing (default-off)
++        m.put("entities.tracker.coalesce.enabled", "false");
++        m.put("entities.tracker.coalesce.farDistance", "96");
++        m.put("entities.tracker.coalesce.interval", "3");
+         m.put("entities.tracker.vanish.cache.enabled", "true");
+         m.put("portals.routing_enabled", "false");
+         m.put("profiling.enabled", "false");
+@@ -348,4 +368,16 @@ public final class HerculiConfig {
+     public int fairnessDiagnosticsDrainBudget() { return Math.max(1, getInt("fairness.diagnosticsDrain.budget", 32)); }
+     public int fairnessAsyncCompletionsBudget() { return Math.max(1, getInt("fairness.asyncCompletions.budget", 64)); }
+     public boolean fairnessDebug() { return getBoolean("fairness.debug", false); }
++
++    // Tracker coalescing getters
++    public boolean trackerCoalesceEnabled() { return getBoolean("entities.tracker.coalesce.enabled", false); }
++    public int trackerCoalesceFarDistance() { return Math.max(1, getInt("entities.tracker.coalesce.farDistance", 96)); }
++    public int trackerCoalesceInterval() { return Math.max(1, getInt("entities.tracker.coalesce.interval", 3)); }
++    public int trackerViewerHysteresisBlocks() { return Math.max(0, getInt("entities.tracker.hysteresis.blocks", 24)); }
++
++    // Spawn pressure getters
++    public boolean spawnPressureEnabled() { return getBoolean("spawning.mob_pressure.enabled", false); }
++    public int spawnPressureLimitPercent() { return Math.max(0, Math.min(100, getInt("spawning.mob_pressure.per_category_limit_percent", 100))); }
++    public int spawnPressureMaxGroupsPerPos() { return Math.max(1, getInt("spawning.mob_pressure.max_groups_per_pos", 3)); }
++    public int spawnPressureMaxAttemptsPerGroup() { return Math.max(1, getInt("spawning.mob_pressure.max_attempts_per_group", 4)); }
+ }

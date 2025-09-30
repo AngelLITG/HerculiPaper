@@ -1,68 +1,27 @@
-// === HOTSPOT PRIORITIES ===
-- DONE Performance: TicketStorage.purgeStaleTickets incremental purge
-- DONE Performance: Improve chunk-packet cache hit rate
-- WIP Performance: NaturalSpawner hot path optimizations (nearest player + early exits)
-  - Replace global getNearestPlayer with regionized NearbyPlayers lookup (done)
-  - Early-exit when maxSpawns <= 0 (done)
-  - Cap group size by remaining allowed Spawns (done)
-  - Break early when no players in TICK_VIEW_DISTANCE for area (done)
-  - Add per-invocation mobsAt() cache by (ChunkPos, category) to avoid repeated biome/structure lookups (done)
-- WIP Performance: Despawn nearest-player optimization
-  - Reorder cheap prechecks before Bukkit event/registry to avoid CraftEntityType.minecraftToBukkit cost (done)
-  - Next: fast-fail path for SpawnPlacements when block state or fluid invalid, before event conversion (TODO) [verify residual cost]
-  - Goal: reduce time in NaturalSpawner.spawnForChunk/categoryForPosition by ≥40% under 500-bot hard test (current: 23.8ms/13.1ms)
-- WIP AI: Reduce nearest-player query cost in goals and despawn paths
-  - DONE Wire NearbyPlayers-backed fast path in EntityGetter:
-    - getNearestPlayer(x,y,z,dist,predicate)
-    - hasNearbyAlivePlayerThatAffectsSpawning(x,y,z,range)
-    - hasNearbyAlivePlayer(x,y,z,dist)
-  - TODO Validate reductions in: TemptGoal/NearestAttackableTargetGoal/GoalSelector, and BaseSpawner.isNearPlayer
-  - Goal: reduce AI nearest-player time (now ~1.82ms) by ≥50%
-- DONE Despawn checks: fast prefilter before Mob.checkDespawn to skip heavy work when clearly out-of-range or capped
-  - Implemented regionized NearbyPlayers null-check early return
-  - Goal: reduce Mob.checkDespawn (now 2.49ms) by ≥40%
 
-// === New Hotspots (700 players) ===
-- WIP Despawn nearest-player hotspot optimization (Mob.checkDespawn)
- - Subtasks
-  - DONE Analyze Spark: Mob.checkDespawn 5.48ms; EntityGetter.getNearestPlayer 5.25ms under despawn path
-  - WIP Implement specialized fast path in `EntityGetter.findNearbyPlayer()` for `PLAYER_AFFECTS_SPAWNING`
-   - DONE Remove HashSet de-dup and multi-chunk iteration (regression fix)
-   - DONE Use single-chunk `NearbyPlayers` list; cap by squared distance; return without global fallback when candidate exists
-  - TODO Add squared-distance cap from category despawn ranges when maxDistance < 0
-  - TODO Re-profile to target 1–2ms for Mob.checkDespawn at 700 players
-- TODO Reduce tracker churn in `ChunkMap$TrackedEntity.updatePlayer`
- - Subtasks
-  - DONE Batch viewer diffs per tick: update without rebuilding and rebuild once at end (`herculi$updatePlayerNoRebuild`, single rebuild in `updatePlayers`)
-  - DONE Cache CraftPlayer.canSee results per-entity per-tick (per-tick `herculi$vanishVisibleCache` with tick rollover clear)
-  - DONE Hoist HerculiConfig reads to per-tick cache in TrackedEntity (`herculi$ensureConfigCached`) to avoid hot-path lookups
-  - Goal: newTrackerTick ~5–7ms, updatePlayer ~3–4ms
-- TODO Validate NaturalSpawner stability (met goals)
- - Subtasks
-  - TODO Keep current early exits and noise-biome holder; monitor for regressions
-  - Targets met: spawnForChunk 10.97ms, spawnCategoryForPosition 4.71ms, mobsAt 1.07ms
-
-// === NaturalSpawner ===
-- DONE Pre-event inclusion check in NaturalSpawner.isValidSpawnPositionForType
-  - Run biome/structure inclusion before PreCreatureSpawnEvent to avoid event cost on impossible spawns
-- DONE Skip spawnForChunk when no players near chunk (NearbyPlayers null/empty)
-- DONE Treat empty NearbyPlayers as no players in spawnCategoryForPosition
-- DONE Reduce biome lookup overhead by passing chunk noise-biome holder to mobsAt() in spawnCategoryForPosition
-- TODO Further reduce NaturalSpawner costs
-  - Reduce Level.getBiome in hot path (target <1.5ms) by passing biome holder when available and minimizing repeated lookups
-  - Confirm mobsAt cache hit-rate and safety across multi-biome chunks; tighten keying if needed
-  - Goal: spawnForChunk ≤ 15ms, spawnCategoryForPosition ≤ 6ms, mobsAt ≤ 2.2ms
-
-// === Performance tasks from 800-mover test ===
-- WIP Performance: Reduce tracker churn in ChunkMap.TrackedEntity.updatePlayer
-  - Optimize seenBy structure (avoid Collections.newSetFromMap(ConcurrentHashMap) on main thread)
-  - Batch add/remove; minimize contains checks
-  - Goal: reduce time in ChunkMap.newTrackerTick/updatePlayer
+// === Latest Optimizations (Target: 118ms → 50-60ms) ===
+- DONE Batch 1: Tracking and AI optimizations (-12ms win, validated)
+  - DONE Skip stationary entity tracking (skip if moved <1.0 blocks)
+    - Config: entities.tracker.skip_stationary (default: true)
+    - Result: 39.22ms → 29.02ms (-10.2ms, -26%)
+  - DONE Cache nearest player for AI goals (4-tick cache)
+    - Implemented in Mob.herculi$getCachedNearestPlayer()
+    - Modified TemptGoal to use cached version
+    - Result: Mob.tick 5.31ms → 3.14ms (-2.17ms, -41%)
+- DONE Batch 2: Player block checks + aggressive tracking
+  - DONE Skip player block checks if stationary (moved <0.1 blocks)
+  - DONE Increase tracking threshold (0.5 → 1.0 blocks)
+  - DONE Skip far entities every other tick (>64 blocks)
+    - Config: entities.tracker.skip_far_distance_sq (default: 4096)
+- DONE Async Join Protocol Changes (Critical fix for 4 TPS during joins)
+  - DONE Make Connection.syncAfterConfigurationChange() async
+    - Config: networking.async_join_protocol (default: true)
+    - Impact: 4ms blocking per join → ~0ms (async listener)
+    - Result: Should fix 4 TPS during 1000 bot joins (was 1000×4ms = 4s of blocking)
 
 3) Async chunk IO + light pipeline
- - DONE Prefetch scaffold: HerculiChunkPipeline.prefetchChunk
- - DONE Wire minimal async read stage behind config gate
- - DONE Define stage config flags and guardrails
+  - DONE Prefetch scaffold: HerculiChunkPipeline.prefetchChunk
+  - DONE Wire minimal async read stage behind config gate
 4) Entity scheduler & handoff
  - DONE Scaffold: EntityRegionScheduler.execute/supply (region-affine, gated)
  - DONE Identify low-risk hook points (no behavior change; default-off)
@@ -210,10 +169,14 @@ tasks-completed:
 64) 0068-Optimization-Write-player-saves-async.patch DONE
 65) 0034-Add-various-API-for-Folia-plugin-compatibility.patch DONE
 66) Add testing subcommands: thread, sound, particle DONE
-- Create Herculi server configuration file `herculi.yml` and wire feature gates DONE
+ - Create Herculi server configuration file `herculi.yml` and wire feature gates DONE
  - DONE Auto-merge missing `herculi.yml` keys on startup/reload
-
 67) Performance: Cache HerculiConfig flags in hot paths (ChunkMap, ServerGamePacketListenerImpl) DONE
 68) Performance: Cache isChunkNearPlayer/collectSpawningChunks via player-near bitset DONE
 69) Performance: TicketStorage.purgeStaleTickets incremental purge DONE
 70) Performance: Improve chunk-packet cache hit rate DONE
+71) Tracker churn: tick-stamped vanish cache and distance hysteresis DONE
+72) Fast membership map for viewers in ChunkMap$TrackedEntity DONE
+73) Performance: Replace CHM vanish cache with fastutil Object2LongOpenHashMap DONE
+74) Performance: Batch viewer array rebuilds to reduce overhead DONE
+75) Performance: AI tick throttling for far entities DONE

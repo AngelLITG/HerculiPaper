@@ -1,0 +1,869 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Angel <achaparro@lifeisthegame.email>
+Date: Tue, 30 Sep 2025 11:35:37 -0500
+Subject: [PATCH] Mobs stable
+
+
+diff --git a/net/minecraft/network/Connection.java b/net/minecraft/network/Connection.java
+index 958387c0e2c52ca18a8090159ff16ef0e4bf8974..dcd911878b86f498f0c72ef8513b6ecc507e00dc 100644
+--- a/net/minecraft/network/Connection.java
++++ b/net/minecraft/network/Connection.java
+@@ -327,14 +327,33 @@ public class Connection extends SimpleChannelInboundHandler<Packet<?>> {
+         }
+     }
+ 
++    // Herculi: Make protocol changes async to avoid blocking main thread during player joins
+     private static void syncAfterConfigurationChange(ChannelFuture future) {
++        // Check if async join protocol changes are enabled
++        boolean asyncJoin = false;
+         try {
+-            future.syncUninterruptibly();
+-        } catch (Exception var2) {
+-            if (var2 instanceof ClosedChannelException) {
+-                LOGGER.info("Connection closed during protocol change");
+-            } else {
+-                throw var2;
++            asyncJoin = io.multipaper.herculi.config.HerculiConfig.instance().getBoolean("networking.async_join_protocol", true);
++        } catch (Throwable ignored) {}
++        
++        if (asyncJoin) {
++            // Async: Don't block main thread, add listener for error handling only
++            future.addListener(f -> {
++                if (!f.isSuccess() && f.cause() != null) {
++                    if (!(f.cause() instanceof ClosedChannelException)) {
++                        LOGGER.error("Protocol change failed asynchronously", f.cause());
++                    }
++                }
++            });
++        } else {
++            // Legacy sync behavior
++            try {
++                future.syncUninterruptibly();
++            } catch (Exception var2) {
++                if (var2 instanceof ClosedChannelException) {
++                    LOGGER.info("Connection closed during protocol change");
++                } else {
++                    throw var2;
++                }
+             }
+         }
+     }
+diff --git a/net/minecraft/server/level/ChunkMap.java b/net/minecraft/server/level/ChunkMap.java
+index 357d3d5f4000cef7a6e56c6b400c16f58eb23851..9ce5cf2dcb7fb0506fe0ee6e7cc7ea46448d411f 100644
+--- a/net/minecraft/server/level/ChunkMap.java
++++ b/net/minecraft/server/level/ChunkMap.java
+@@ -1187,19 +1187,59 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+         final Entity entity;
+         private final int range;
+         SectionPos lastSectionPos;
+-        public final java.util.Set<ServerPlayerConnection> seenBy = java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<ServerPlayerConnection, Boolean>()); // Paper - Perf: optimise map impl; Herculi - thread-safe set to avoid CME
++        // Fast membership map keyed by player id for O(1) contains/add/remove
++        private final it.unimi.dsi.fastutil.ints.Int2ObjectMap<ServerPlayerConnection> seenByMap = new it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<>();
++        // Public Set view for API compatibility (iteration + contains/add/remove)
++        public final java.util.Set<ServerPlayerConnection> seenBy = new java.util.AbstractSet<ServerPlayerConnection>() {
++            @Override
++            public java.util.Iterator<ServerPlayerConnection> iterator() {
++                return seenByMap.values().iterator();
++            }
++
++            @Override
++            public int size() {
++                return seenByMap.size();
++            }
++
++            @Override
++            public boolean contains(Object o) {
++                if (!(o instanceof ServerPlayerConnection spc)) return false;
++                final ServerPlayer p = spc.getPlayer();
++                return p != null && seenByMap.get(p.getId()) == spc;
++            }
++
++            @Override
++            public boolean add(ServerPlayerConnection spc) {
++                final ServerPlayer p = spc.getPlayer();
++                if (p == null) return false;
++                return seenByMap.putIfAbsent(p.getId(), spc) == null;
++            }
++
++            @Override
++            public boolean remove(Object o) {
++                if (!(o instanceof ServerPlayerConnection spc)) return false;
++                final ServerPlayer p = spc.getPlayer();
++                if (p == null) return false;
++                return seenByMap.remove(p.getId(), spc);
++            }
++        };
+         // 0019: WeakSeqLock to provide stable reader snapshots for broadcasting
+         private final io.multipaper.herculi.concurrent.WeakSeqLock herculiSeq = new io.multipaper.herculi.concurrent.WeakSeqLock();
+         private boolean herculi$loggedTrackerCap = false; // 0064: ensure one-time log when cap is hit
+ 
+         // Herculi: volatile snapshot array to avoid iterating concurrent set during broadcasts
+         private volatile ServerPlayerConnection[] herculi$viewersArray = new ServerPlayerConnection[0];
++        // Batch rebuild: track pending changes and rebuild only when threshold exceeded or tick boundary
++        private int herculi$pendingChanges = 0;
++        private boolean herculi$needsRebuild = false;
+ 
+         // Paper start - optimise entity tracker
+         private long lastChunkUpdate = -1L;
+         private ca.spottedleaf.moonrise.common.misc.NearbyPlayers.TrackedChunk lastTrackedChunk;
+         // 0060: Vanish visibility cache per tick to reduce canSee() overhead
+-        private final java.util.Map<java.util.UUID, java.lang.Boolean> herculi$vanishVisibleCache = new java.util.concurrent.ConcurrentHashMap<>();
++        // Tick-stamped: value packs (tick<<1) | (visible?1:0) to avoid per-tick clear()
++        // Replaced CHM with fastutil primitive map: TrackedEntity accessed only from owning region thread
++        private final it.unimi.dsi.fastutil.objects.Object2LongOpenHashMap<java.util.UUID> herculi$vanishVisibleCache = new it.unimi.dsi.fastutil.objects.Object2LongOpenHashMap<>();
+         // 0066: Per-tick config cache to avoid repeated lookups on hot path
+         private long herculi$configTick = Long.MIN_VALUE;
+         private boolean herculi$cfgVanishCacheEnabled;
+@@ -1207,6 +1247,14 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+         private int herculi$cfgMaxPerEntityCap;
+         private int herculi$cfgTrackingCapGlobal;
+         private java.util.Set<String> herculi$cfgTrackingHeavyTypes;
++        private int herculi$cfgHysteresisBlocks;
++        // Stationary entity optimization: skip tracking updates if entity hasn't moved
++        private boolean herculi$cfgSkipStationaryTracking;
++        private double herculi$cfgSkipFarEntitiesDistanceSq;
++        private double herculi$lastTrackedX = Double.NaN;
++        private double herculi$lastTrackedY = Double.NaN;
++        private double herculi$lastTrackedZ = Double.NaN;
++        private int herculi$ticksSinceLastUpdate = 0;
+ 
+         // Refresh cached config once per game tick and clear vanish cache across tick rollover
+         private void herculi$ensureConfigCached() {
+@@ -1220,10 +1268,16 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+                 this.herculi$cfgVanishCacheEnabled = cfg.getBoolean("entities.tracker.vanish.cache.enabled", true);
+                 this.herculi$cfgHandoffTrackerPacketsEnabled = cfg.handoffTrackerPacketsEnabled();
+                 this.herculi$cfgMaxPerEntityCap = Math.max(1, cfg.getInt("entities.tracker.max_per_entity", 512));
++                this.herculi$cfgHysteresisBlocks = Math.max(0, cfg.getInt("entities.tracker.hysteresis.blocks", 24));
++                this.herculi$cfgSkipStationaryTracking = cfg.getBoolean("entities.tracker.skip_stationary", true);
++                this.herculi$cfgSkipFarEntitiesDistanceSq = (double) cfg.getInt("entities.tracker.skip_far_distance_sq", 4096); // 64 blocks
+             } catch (Throwable ignored) {
+                 this.herculi$cfgVanishCacheEnabled = true;
+                 this.herculi$cfgHandoffTrackerPacketsEnabled = false;
+                 this.herculi$cfgMaxPerEntityCap = 512;
++                this.herculi$cfgHysteresisBlocks = 24;
++                this.herculi$cfgSkipStationaryTracking = true;
++                this.herculi$cfgSkipFarEntitiesDistanceSq = 4096.0;
+             }
+             try {
+                 this.herculi$cfgTrackingCapGlobal = io.papermc.paper.FeatureHooks.herculi_getTrackingCapGlobal();
+@@ -1235,8 +1289,7 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+             } catch (Throwable ignored) {
+                 this.herculi$cfgTrackingHeavyTypes = java.util.Set.of();
+             }
+-            // conservative: clear vanish cache when ticking
+-            this.herculi$vanishVisibleCache.clear();
++            // Tick-stamped cache: no mass clear needed
+         }
+ 
+         @Override
+@@ -1253,20 +1306,76 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+                 return;
+             }
+ 
++            // Herculi: Skip tracking update if entity hasn't moved significantly OR is far from all players
++            this.herculi$ensureConfigCached();
++            
++            final ServerPlayer[] playersRaw = players.getRawDataUnchecked();
++            final int playersLen = players.size();
++            
++            boolean skipUpdate = false;
++            
++            // Check if entity is stationary
++            if (this.herculi$cfgSkipStationaryTracking) {
++                final double ex = this.entity.getX();
++                final double ey = this.entity.getY();
++                final double ez = this.entity.getZ();
++                if (!Double.isNaN(this.herculi$lastTrackedX)) {
++                    final double dx = ex - this.herculi$lastTrackedX;
++                    final double dy = ey - this.herculi$lastTrackedY;
++                    final double dz = ez - this.herculi$lastTrackedZ;
++                    // Skip if moved less than 1.0 block (increased from 0.5 for more aggressive skipping)
++                    if (dx*dx + dy*dy + dz*dz < 1.0) {
++                        skipUpdate = true;
++                    } else {
++                        this.herculi$lastTrackedX = ex;
++                        this.herculi$lastTrackedY = ey;
++                        this.herculi$lastTrackedZ = ez;
++                    }
++                } else {
++                    // First tick: record position
++                    this.herculi$lastTrackedX = ex;
++                    this.herculi$lastTrackedY = ey;
++                    this.herculi$lastTrackedZ = ez;
++                }
++            }
++            
++            // Additional optimization: Skip every other tick for far entities (>64 blocks from nearest player)
++            if (!skipUpdate && this.herculi$cfgSkipFarEntitiesDistanceSq > 0 && playersLen > 0) {
++                this.herculi$ticksSinceLastUpdate++;
++                double minDistSq = Double.MAX_VALUE;
++                for (int i = 0; i < playersLen; ++i) {
++                    double distSq = playersRaw[i].distanceToSqr(this.entity);
++                    if (distSq < minDistSq) minDistSq = distSq;
++                }
++                // Skip every other tick if far
++                if (minDistSq > this.herculi$cfgSkipFarEntitiesDistanceSq && this.herculi$ticksSinceLastUpdate % 2 != 0) {
++                    skipUpdate = true;
++                }
++            }
++
+             final long lastChunkUpdate = this.lastChunkUpdate;
+             final long currChunkUpdate = chunk.getUpdateCount();
+             final ca.spottedleaf.moonrise.common.misc.NearbyPlayers.TrackedChunk lastTrackedChunk = this.lastTrackedChunk;
+             this.lastChunkUpdate = currChunkUpdate;
+             this.lastTrackedChunk = chunk;
+-            // 0060: reset vanish cache when player list may have changed
+-            this.herculi$vanishVisibleCache.clear();
+-
+-            final ServerPlayer[] playersRaw = players.getRawDataUnchecked();
+-            final int playersLen = players.size();
+-
+-            for (int i = 0, len = playersLen; i < len; ++i) {
+-                final ServerPlayer player = playersRaw[i];
+-                this.updatePlayer(player);
++            // 0060: no explicit clear; per-entry values are tick-stamped and self-expire logically
++
++            boolean anyChanged = false;
++            if (!skipUpdate) {
++                for (int i = 0, len = playersLen; i < len; ++i) {
++                    final ServerPlayer player = playersRaw[i];
++                    if (this.herculi$updatePlayerNoRebuild(player)) {
++                        anyChanged = true;
++                        this.herculi$pendingChanges++;
++                    }
++                }
++            }
++            if (anyChanged) {
++                this.herculi$needsRebuild = true;
++                // Batch: rebuild immediately if many changes, otherwise defer to end of tick
++                if (this.herculi$pendingChanges >= 8) {
++                    this.herculi$rebuildViewersArray();
++                }
+             }
+ 
+             if (lastChunkUpdate != currChunkUpdate || lastTrackedChunk != chunk) {
+@@ -1278,10 +1387,22 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+                     if (!this.herculi$listContains(playersRaw, playersLen, player)) {
+                         this.herculi$removePlayerNoRebuild(player);
+                         anyRemoved = true;
++                        this.herculi$pendingChanges++;
++                    }
++                }
++                if (anyRemoved) {
++                    this.herculi$needsRebuild = true;
++                    if (this.herculi$pendingChanges >= 8) {
++                        this.herculi$rebuildViewersArray();
+                     }
+                 }
+-                if (anyRemoved) this.herculi$rebuildViewersArray();
+             }
++            // End of tick: flush any pending rebuild
++            if (this.herculi$needsRebuild && this.herculi$pendingChanges > 0 && this.herculi$pendingChanges < 8) {
++                this.herculi$rebuildViewersArray();
++            }
++            this.herculi$pendingChanges = 0;
++            this.herculi$needsRebuild = false;
+         }
+ 
+         // Fast identity-based contains for ReferenceList raw array without allocations
+@@ -1341,7 +1462,7 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+         private java.util.List<ServerPlayerConnection> herculi$getViewerSnapshot() {
+             for (;;) {
+                 final int stamp = this.herculiSeq.tryReadBegin();
+-                final java.util.ArrayList<ServerPlayerConnection> snapshot = new java.util.ArrayList<>(this.seenBy);
++                final java.util.ArrayList<ServerPlayerConnection> snapshot = new java.util.ArrayList<>(this.seenByMap.values());
+                 if (this.herculiSeq.tryReadValidate(stamp)) {
+                     return snapshot;
+                 }
+@@ -1368,10 +1489,21 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+ 
+         public void broadcastIgnorePlayers(Packet<?> packet, List<UUID> ignoredPlayers) {
+             final ServerPlayerConnection[] viewers = this.herculi$viewersArray;
+-            for (int i = 0, len = viewers.length; i < len; ++i) {
+-                final ServerPlayerConnection c = viewers[i];
+-                if (!ignoredPlayers.contains(c.getPlayer().getUUID())) {
+-                    c.send(packet);
++            final int threshold = 8; // switch to set lookup when ignore list is non-trivial
++            if (ignoredPlayers.size() > threshold) {
++                final java.util.HashSet<UUID> ignoreSet = new java.util.HashSet<>(ignoredPlayers);
++                for (int i = 0, len = viewers.length; i < len; ++i) {
++                    final ServerPlayerConnection c = viewers[i];
++                    if (!ignoreSet.contains(c.getPlayer().getUUID())) {
++                        c.send(packet);
++                    }
++                }
++            } else {
++                for (int i = 0, len = viewers.length; i < len; ++i) {
++                    final ServerPlayerConnection c = viewers[i];
++                    if (!ignoredPlayers.contains(c.getPlayer().getUUID())) {
++                        c.send(packet);
++                    }
+                 }
+             }
+         }
+@@ -1391,14 +1523,14 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+ 
+         // Remove without rebuilding viewers array; used for batched removals
+         private void herculi$removePlayerNoRebuild(ServerPlayer player) {
+-            if (this.seenBy.remove(player.connection)) {
++            if (this.seenByMap.remove(player.getId()) != null) {
+                 this.serverEntity.removePairing(player);
+             }
+         }
+ 
+         public void removePlayer(ServerPlayer player) {
+             org.spigotmc.AsyncCatcher.catchOp("player tracker clear"); // Spigot
+-            if (this.seenBy.remove(player.connection)) {
++            if (this.seenByMap.remove(player.getId()) != null) {
+                 this.herculi$rebuildViewersArray();
+                 this.serverEntity.removePairing(player);
+             }
+@@ -1409,6 +1541,10 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+             org.spigotmc.AsyncCatcher.catchOp("player tracker update"); // Spigot
+             if (player != this.entity) {
+                 this.herculi$ensureConfigCached();
++                // Hysteresis: check viewer status early to enable fast path
++                final int playerId = player.getId();
++                final boolean alreadyViewerEarly = this.seenByMap.containsKey(playerId);
++                
+                 // Paper start - remove allocation of Vec3D here
+                 // Vec3 vec3 = player.position().subtract(this.entity.position());
+                 double vec3_dx = player.getX() - this.entity.getX();
+@@ -1417,9 +1553,13 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+                 int playerViewDistance = ChunkMap.this.getPlayerViewDistance(player);
+                 double d = Math.min(this.getEffectiveRange(), playerViewDistance * 16);
+                 double d1 = vec3_dx * vec3_dx + vec3_dz * vec3_dz; // Paper
+-                double d2 = d * d;
++                final double hysteresis = (alreadyViewerEarly ? (double)this.herculi$cfgHysteresisBlocks : 0.0);
++                final double dEnter = d;
++                final double dExit = d + hysteresis;
++                final double d2Enter = dEnter * dEnter;
++                final double d2Exit = dExit * dExit;
+                 // Paper start - Configurable entity tracking range by Y
+-                boolean flag = d1 <= d2;
++                boolean flag = d1 <= d2Enter;
+                 if (flag && level.paperConfig().entities.trackingRangeY.enabled) {
+                     double rangeY = level.paperConfig().entities.trackingRangeY.get(this.entity, -1);
+                     if (rangeY != -1) {
+@@ -1427,6 +1567,10 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+                         flag = vec3_dy * vec3_dy <= rangeY * rangeY;
+                     }
+                 }
++                // Apply hysteresis on horizontal distance check
++                if (flag) {
++                    flag = alreadyViewerEarly ? (d1 <= d2Exit) : (d1 <= d2Enter);
++                }
+                 flag = flag && this.entity.broadcastToPlayer(player) && ChunkMap.this.isChunkTracked(player, this.entity.chunkPosition().x, this.entity.chunkPosition().z);
+                 // Paper end - Configurable entity tracking range by Y
+                 // CraftBukkit start - respect vanish API
+@@ -1436,12 +1580,16 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+                     try {
+                         if (this.herculi$cfgVanishCacheEnabled) {
+                             final java.util.UUID pid = player.getUUID();
+-                            java.lang.Boolean cached = this.herculi$vanishVisibleCache.get(pid);
+-                            if (cached == null) {
+-                                cached = player.getBukkitEntity().canSee(this.entity.getBukkitEntity());
+-                                this.herculi$vanishVisibleCache.put(pid, cached);
++                            final long tick = ChunkMap.this.level.getGameTime();
++                            final long packed = this.herculi$vanishVisibleCache.getOrDefault(pid, -1L);
++                            if (packed == -1L || (packed >>> 1) != tick) {
++                                boolean vis = player.getBukkitEntity().canSee(this.entity.getBukkitEntity());
++                                long val = (tick << 1) | (vis ? 1L : 0L);
++                                this.herculi$vanishVisibleCache.put(pid, val);
++                                visible = vis;
++                            } else {
++                                visible = (packed & 1L) != 0L;
+                             }
+-                            visible = cached;
+                         } else {
+                             visible = player.getBukkitEntity().canSee(this.entity.getBukkitEntity());
+                         }
+@@ -1468,8 +1616,9 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+                     if (capToUse <= 0) {
+                         capToUse = this.herculi$cfgTrackingCapGlobal;
+                     }
+-                    final int currentSize = this.seenBy.size();
+-                    final boolean alreadyViewer = this.seenBy.contains(player.connection);
++                    final int currentSize = this.seenByMap.size();
++                    // Reuse alreadyViewerEarly to avoid redundant containsKey() lookup
++                    final boolean alreadyViewer = alreadyViewerEarly;
+                     if (capToUse > 0 && currentSize >= capToUse && !alreadyViewer) {
+                         try { io.papermc.paper.FeatureHooks.herculi_incTrackingCapHits(); } catch (Throwable ignored) {}
+                         return false; // skip adding due to heavy/global cap
+@@ -1485,7 +1634,7 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+                         return false; // do not add more viewers beyond cap
+                     }
+ 
+-                    if (!alreadyViewer && this.seenBy.add(player.connection)) {
++                    if (!alreadyViewer && this.seenByMap.putIfAbsent(playerId, player.connection) == null) {
+                         if (this.herculi$cfgHandoffTrackerPacketsEnabled) {
+                             // Execute in player's region and bounce to main for packet emission
+                             final org.bukkit.entity.Player bukkitPlayer = player.getBukkitEntity();
+@@ -1499,7 +1648,7 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+                         }
+                         return true;
+                     }
+-                } else if (this.seenBy.remove(player.connection)) {
++                } else if (this.seenByMap.remove(player.getId()) != null) {
+                     this.serverEntity.removePairing(player);
+                     return true;
+                 }
+@@ -1518,7 +1667,9 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+             // Use seq lock as a write fence for readers using snapshots elsewhere
+             this.herculiSeq.beginWrite();
+             try {
+-                this.herculi$viewersArray = this.seenBy.toArray(new ServerPlayerConnection[0]);
++                this.herculi$viewersArray = this.seenByMap.values().toArray(new ServerPlayerConnection[0]);
++                this.herculi$pendingChanges = 0;
++                this.herculi$needsRebuild = false;
+             } finally {
+                 this.herculiSeq.endWrite();
+             }
+diff --git a/net/minecraft/server/level/ServerEntity.java b/net/minecraft/server/level/ServerEntity.java
+index e96d4dee14c05f2fa329bfb1588ec795d4e3d730..c0e239f1b4e45380f40b5ae67fd523c596ab963f 100644
+--- a/net/minecraft/server/level/ServerEntity.java
++++ b/net/minecraft/server/level/ServerEntity.java
+@@ -76,6 +76,12 @@ public class ServerEntity {
+     private List<SynchedEntityData.DataValue<?>> trackedDataValues;
+     private final Set<net.minecraft.server.network.ServerPlayerConnection> trackedPlayers; // Paper
+ 
++    // Herculi: config-gated packet coalescing for far viewers
++    private boolean herculi$coalesceEnabled;
++    private int herculi$coalesceDistanceSq;
++    private int herculi$coalesceInterval;
++    private long herculi$cfgTickCached = Long.MIN_VALUE;
++
+     public ServerEntity(
+         ServerLevel level,
+         Entity entity,
+@@ -111,6 +117,7 @@ public class ServerEntity {
+     // Paper end - fix desync when a player is added to the tracker
+ 
+     public void sendChanges() {
++        this.herculi$ensureConfigCached();
+         // Paper start - optimise collisions
+         if (((ca.spottedleaf.moonrise.patches.chunk_system.entity.ChunkSystemEntity)this.entity).moonrise$isHardColliding()) {
+             this.teleportDelay = 9999;
+@@ -154,7 +161,7 @@ public class ServerEntity {
+             boolean flag = Math.abs(b - this.lastSentYRot) >= 1 || Math.abs(b1 - this.lastSentXRot) >= 1;
+             if (this.entity.isPassenger()) {
+                 if (flag) {
+-                    this.broadcast.accept(new ClientboundMoveEntityPacket.Rot(this.entity.getId(), b, b1, this.entity.onGround()));
++                    this.herculi$sendWithOptionalIgnore(new ClientboundMoveEntityPacket.Rot(this.entity.getId(), b, b1, this.entity.onGround()));
+                     this.lastSentYRot = b;
+                     this.lastSentXRot = b1;
+                 }
+@@ -213,23 +220,22 @@ public class ServerEntity {
+                     if (d > 1.0E-7 || d > 0.0 && deltaMovement.lengthSqr() == 0.0) {
+                         this.lastSentMovement = deltaMovement;
+                         if (this.entity instanceof AbstractHurtingProjectile abstractHurtingProjectile) {
+-                            this.broadcast
+-                                .accept(
+-                                    new ClientboundBundlePacket(
+-                                        List.of(
+-                                            new ClientboundSetEntityMotionPacket(this.entity.getId(), this.lastSentMovement),
+-                                            new ClientboundProjectilePowerPacket(abstractHurtingProjectile.getId(), abstractHurtingProjectile.accelerationPower)
+-                                        )
++                            this.herculi$sendWithOptionalIgnore(
++                                new ClientboundBundlePacket(
++                                    List.of(
++                                        new ClientboundSetEntityMotionPacket(this.entity.getId(), this.lastSentMovement),
++                                        new ClientboundProjectilePowerPacket(abstractHurtingProjectile.getId(), abstractHurtingProjectile.accelerationPower)
+                                     )
+-                                );
++                                )
++                            );
+                         } else {
+-                            this.broadcast.accept(new ClientboundSetEntityMotionPacket(this.entity.getId(), this.lastSentMovement));
++                            this.herculi$sendWithOptionalIgnore(new ClientboundSetEntityMotionPacket(this.entity.getId(), this.lastSentMovement));
+                         }
+                     }
+                 }
+ 
+                 if (packet != null) {
+-                    this.broadcast.accept(packet);
++                    this.herculi$sendWithOptionalIgnore(packet);
+                 }
+ 
+                 this.sendDirtyEntityData();
+@@ -247,7 +253,7 @@ public class ServerEntity {
+ 
+             byte b2 = Mth.packDegrees(this.entity.getYHeadRot());
+             if (Math.abs(b2 - this.lastSentYHeadRot) >= 1) {
+-                this.broadcast.accept(new ClientboundRotateHeadPacket(this.entity, b2));
++                this.herculi$sendWithOptionalIgnore(new ClientboundRotateHeadPacket(this.entity, b2));
+                 this.lastSentYHeadRot = b2;
+             }
+ 
+@@ -277,10 +283,65 @@ public class ServerEntity {
+             }
+             // CraftBukkit end
+             this.entity.hurtMarked = false;
++            // Hurt motion packets should not be coalesced to avoid desync
+             this.broadcastAndSend(new ClientboundSetEntityMotionPacket(this.entity));
+         }
+     }
+ 
++    // Build ignored list of far viewers when coalescing is enabled and not on a send tick
++    private List<UUID> herculi$ignoredFarViewersThisTick() {
++        if (!this.herculi$coalesceEnabled) return java.util.Collections.emptyList();
++        if (this.herculi$coalesceInterval <= 1) return java.util.Collections.emptyList();
++        if ((this.tickCount % this.herculi$coalesceInterval) == 0) return java.util.Collections.emptyList();
++        if (this.trackedPlayers.isEmpty()) return java.util.Collections.emptyList();
++        final ArrayList<UUID> ignored = new ArrayList<>();
++        final double ex = this.entity.getX();
++        final double ey = this.entity.getY();
++        final double ez = this.entity.getZ();
++        for (final net.minecraft.server.network.ServerPlayerConnection c : this.trackedPlayers) {
++            final ServerPlayer p = c.getPlayer();
++            final double dx = p.getX() - ex;
++            final double dy = p.getY() - ey;
++            final double dz = p.getZ() - ez;
++            final double distSq = dx*dx + dy*dy + dz*dz;
++            if (distSq > this.herculi$coalesceDistanceSq) {
++                ignored.add(p.getUUID());
++            }
++        }
++        return ignored;
++    }
++
++    private void herculi$sendWithOptionalIgnore(final Packet<?> packet) {
++        if (this.herculi$coalesceEnabled) {
++            final List<UUID> ignored = this.herculi$ignoredFarViewersThisTick();
++            if (!ignored.isEmpty()) {
++                this.broadcastWithIgnore.accept(packet, ignored);
++                return;
++            }
++        }
++        this.broadcast.accept(packet);
++    }
++
++    private void herculi$ensureConfigCached() {
++        final long tick = this.level.getGameTime();
++        if (this.herculi$cfgTickCached == tick) return;
++        this.herculi$cfgTickCached = tick;
++        try {
++            final boolean enabled = io.multipaper.herculi.config.HerculiConfig.instance().getBoolean("entities.tracker.coalesce.enabled", false);
++            final int dist = io.multipaper.herculi.config.HerculiConfig.instance().getInt("entities.tracker.coalesce.farDistance", 96);
++            final int interval = io.multipaper.herculi.config.HerculiConfig.instance().getInt("entities.tracker.coalesce.interval", 3);
++            this.herculi$coalesceEnabled = enabled;
++            this.herculi$coalesceInterval = Math.max(1, interval);
++            final int d = Math.max(1, dist);
++            this.herculi$coalesceDistanceSq = d * d;
++        } catch (Throwable t) {
++            // Fallback safe defaults
++            this.herculi$coalesceEnabled = false;
++            this.herculi$coalesceInterval = 1;
++            this.herculi$coalesceDistanceSq = 96 * 96;
++        }
++    }
++
+     private Stream<Entity> mountedOrDismounted(List<Entity> entities) {
+         return Streams.concat(
+             this.lastPassengers.stream().filter(entity -> !entities.contains(entity)),
+diff --git a/net/minecraft/world/entity/Entity.java b/net/minecraft/world/entity/Entity.java
+index b412bcd7bc66d09f9eb00a9dad221d0293fc158b..85c87edc4e123e9eda0192aee0af05d2b6187218 100644
+--- a/net/minecraft/world/entity/Entity.java
++++ b/net/minecraft/world/entity/Entity.java
+@@ -340,6 +340,10 @@ public abstract class Entity implements SyncedDataHolder, Nameable, EntityAccess
+     private final LongSet visitedBlocks = new LongOpenHashSet();
+     private final InsideBlockEffectApplier.StepBasedCollector insideEffectCollector = new InsideBlockEffectApplier.StepBasedCollector();
+     private CustomData customData = CustomData.EMPTY;
++    // Herculi: Cache for skipping block checks when stationary
++    private double herculi$lastBlockCheckX = Double.NaN;
++    private double herculi$lastBlockCheckY = Double.NaN;
++    private double herculi$lastBlockCheckZ = Double.NaN;
+     // CraftBukkit start
+     public boolean forceDrops;
+     public boolean persist = true;
+@@ -1382,8 +1386,36 @@ public abstract class Entity implements SyncedDataHolder, Nameable, EntityAccess
+             boolean isOnFire = this.isOnFire();
+             boolean isFreezing = this.isFreezing();
+             int remainingFireTicks = this.getRemainingFireTicks();
+-            this.checkInsideBlocks(movements, this.insideEffectCollector);
+-            this.insideEffectCollector.applyAndClear(this);
++            
++            // Herculi: Skip block checks if entity hasn't moved >0.1 blocks
++            boolean skipBlockCheck = false;
++            if (this instanceof net.minecraft.world.entity.player.Player) {
++                final double px = this.getX();
++                final double py = this.getY();
++                final double pz = this.getZ();
++                if (!Double.isNaN(this.herculi$lastBlockCheckX)) {
++                    final double dx = px - this.herculi$lastBlockCheckX;
++                    final double dy = py - this.herculi$lastBlockCheckY;
++                    final double dz = pz - this.herculi$lastBlockCheckZ;
++                    // Skip if moved less than 0.1 blocks
++                    if (dx*dx + dy*dy + dz*dz < 0.01) {
++                        skipBlockCheck = true;
++                    } else {
++                        this.herculi$lastBlockCheckX = px;
++                        this.herculi$lastBlockCheckY = py;
++                        this.herculi$lastBlockCheckZ = pz;
++                    }
++                } else {
++                    this.herculi$lastBlockCheckX = px;
++                    this.herculi$lastBlockCheckY = py;
++                    this.herculi$lastBlockCheckZ = pz;
++                }
++            }
++            
++            if (!skipBlockCheck) {
++                this.checkInsideBlocks(movements, this.insideEffectCollector);
++                this.insideEffectCollector.applyAndClear(this);
++            }
+             if (this.isInRain()) {
+                 this.clearFire();
+             }
+diff --git a/net/minecraft/world/entity/Mob.java b/net/minecraft/world/entity/Mob.java
+index 6c4aebca1a91fb5b631264aed5a7f8a86062515a..4a80dc8d7cbf291b06a24244f661805f61ee022f 100644
+--- a/net/minecraft/world/entity/Mob.java
++++ b/net/minecraft/world/entity/Mob.java
+@@ -141,6 +141,9 @@ public abstract class Mob extends LivingEntity implements EquipmentUser, Leashab
+     public boolean aware = true; // CraftBukkit
+     public net.kyori.adventure.util.TriState despawnInPeacefulOverride = net.kyori.adventure.util.TriState.NOT_SET; // Paper - allow changing despawnInPeaceful
+     public int ticksSinceLastInteraction; // Purpur - Entity lifespan
++    // Herculi: Cache nearest player result to reduce AI queries
++    private Player herculi$cachedNearestPlayer = null;
++    private int herculi$cachedNearestPlayerTick = -999;
+ 
+     protected Mob(EntityType<? extends Mob> entityType, Level level) {
+         super(entityType, level);
+@@ -212,11 +215,32 @@ public abstract class Mob extends LivingEntity implements EquipmentUser, Leashab
+     @Override
+     public void inactiveTick() {
+         super.inactiveTick();
+-        if (this.goalSelector.inactiveTick()) {
+-            this.goalSelector.tick();
++        // Herculi: config-gated AI throttle to reduce goal selector cost for far entities
++        final boolean herculiThrottle = this.herculi$shouldThrottleAI();
++        if (!herculiThrottle || (this.tickCount % 4 == 0)) {
++            if (this.goalSelector.inactiveTick()) {
++                this.goalSelector.tick();
++            }
++            if (this.targetSelector.inactiveTick()) {
++                this.targetSelector.tick();
++            }
+         }
+-        if (this.targetSelector.inactiveTick()) {
+-            this.targetSelector.tick();
++    }
++    
++    private boolean herculi$shouldThrottleAI() {
++        try {
++            if (!io.multipaper.herculi.config.HerculiConfig.instance().getBoolean("entities.ai.throttle.enabled", false)) {
++                return false;
++            }
++            final double distSq = io.multipaper.herculi.config.HerculiConfig.instance().getInt("entities.ai.throttle.distanceSq", 4096);
++            final net.minecraft.world.entity.player.Player nearest = this.level().getNearestPlayer(this, 128.0);
++            if (nearest == null) return true;
++            final double dx = nearest.getX() - this.getX();
++            final double dy = nearest.getY() - this.getY();
++            final double dz = nearest.getZ() - this.getZ();
++            return (dx*dx + dy*dy + dz*dz) > distSq;
++        } catch (Throwable ignored) {
++            return false;
+         }
+     }
+     // Paper end
+@@ -255,6 +279,23 @@ public abstract class Mob extends LivingEntity implements EquipmentUser, Leashab
+         return this.getBrain().getMemory(MemoryModuleType.ATTACK_TARGET).orElse(null);
+     }
+ 
++    // Herculi: Get nearest player with 4-tick caching to reduce AI queries
++    @Nullable
++    public Player herculi$getCachedNearestPlayer(double maxDistance) {
++        final int currentTick = this.tickCount;
++        // Cache valid for 4 ticks
++        if (currentTick - this.herculi$cachedNearestPlayerTick < 4 && this.herculi$cachedNearestPlayer != null) {
++            // Validate cached player is still valid
++            if (this.herculi$cachedNearestPlayer.isAlive() && this.herculi$cachedNearestPlayer.distanceToSqr(this) <= maxDistance * maxDistance) {
++                return this.herculi$cachedNearestPlayer;
++            }
++        }
++        // Cache expired or invalid, recompute
++        this.herculi$cachedNearestPlayer = this.level().getNearestPlayer(this, maxDistance);
++        this.herculi$cachedNearestPlayerTick = currentTick;
++        return this.herculi$cachedNearestPlayer;
++    }
++
+     public void setTarget(@Nullable LivingEntity target) {
+         // CraftBukkit start - fire event
+         this.setTarget(target, EntityTargetEvent.TargetReason.UNKNOWN);
+diff --git a/net/minecraft/world/entity/ai/goal/TemptGoal.java b/net/minecraft/world/entity/ai/goal/TemptGoal.java
+index a805c9426630c2c46db9d0dd536f1d16769395d3..3ecf6def52cd77dc79705491db16f35f2cb6e465 100644
+--- a/net/minecraft/world/entity/ai/goal/TemptGoal.java
++++ b/net/minecraft/world/entity/ai/goal/TemptGoal.java
+@@ -55,8 +55,20 @@ public class TemptGoal extends Goal {
+             this.calmDown--;
+             return false;
+         } else {
+-            this.player = getServerLevel(this.mob)
+-                .getNearestPlayer(this.targetingConditions.range(this.mob.getAttributeValue(Attributes.TEMPT_RANGE)), this.mob);
++            // Herculi: Use cached nearest player to reduce AI query cost
++            final double temptRange = this.mob.getAttributeValue(Attributes.TEMPT_RANGE);
++            Player nearestPlayer = this.mob.herculi$getCachedNearestPlayer(temptRange);
++            
++            // Apply targeting conditions manually to cached result
++            if (nearestPlayer != null) {
++                if (!this.shouldFollow(nearestPlayer)) {
++                    nearestPlayer = null;
++                } else if (this.mob.distanceToSqr(nearestPlayer) > temptRange * temptRange) {
++                    nearestPlayer = null;
++                }
++            }
++            
++            this.player = nearestPlayer;
+             // CraftBukkit start
+             if (this.player != null) {
+                 org.bukkit.event.entity.EntityTargetLivingEntityEvent event = org.bukkit.craftbukkit.event.CraftEventFactory.callEntityTargetLivingEvent(this.mob, this.player, org.bukkit.event.entity.EntityTargetEvent.TargetReason.TEMPT);
+diff --git a/net/minecraft/world/level/NaturalSpawner.java b/net/minecraft/world/level/NaturalSpawner.java
+index 79da43af70530208d4fe55fc592df35ebd5f2f47..46654792c89a97be512cbf5ff0df9997112d68aa 100644
+--- a/net/minecraft/world/level/NaturalSpawner.java
++++ b/net/minecraft/world/level/NaturalSpawner.java
+@@ -64,6 +64,36 @@ public final class NaturalSpawner {
+     private NaturalSpawner() {
+     }
+ 
++    // Herculi: per-tick config cache to avoid repeated config lookups and string parsing in hot paths
++    private static final class HerculiTickCache {
++        private long tick = Long.MIN_VALUE;
++        private boolean spawnPressureEnabled;
++        private int spawnPressurePercent;
++        private int spawnPressureMaxGroupsPerPos;
++        private int spawnPressureMaxAttemptsPerGroup;
++
++        void refreshIfNeeded(final ServerLevel level) {
++            final long now = level.getGameTime();
++            if (this.tick == now) return;
++            this.tick = now;
++            try {
++                final io.multipaper.herculi.config.HerculiConfig cfg = io.multipaper.herculi.config.HerculiConfig.instance();
++                this.spawnPressureEnabled = cfg.spawnPressureEnabled();
++                this.spawnPressurePercent = cfg.spawnPressureLimitPercent();
++                this.spawnPressureMaxGroupsPerPos = cfg.spawnPressureMaxGroupsPerPos();
++                this.spawnPressureMaxAttemptsPerGroup = cfg.spawnPressureMaxAttemptsPerGroup();
++            } catch (Throwable ignored) {
++                this.spawnPressureEnabled = false;
++                this.spawnPressurePercent = 100;
++                this.spawnPressureMaxGroupsPerPos = 3;
++                this.spawnPressureMaxAttemptsPerGroup = Integer.MAX_VALUE;
++            }
++        }
++    }
++
++    // one cache per thread to avoid contention; safe as values are per-tick constants
++    private static final ThreadLocal<HerculiTickCache> HERCULI_TICK_CACHE = ThreadLocal.withInitial(HerculiTickCache::new);
++
+     public static NaturalSpawner.SpawnState createState(
+         int spawnableChunkCount, Iterable<Entity> entities, NaturalSpawner.ChunkGetter chunkGetter, LocalMobCapCalculator calculator
+     ) {
+@@ -126,6 +156,9 @@ public final class NaturalSpawner {
+         // CraftBukkit end
+         List<MobCategory> list = new ArrayList<>(SPAWNING_CATEGORIES.length);
+ 
++        final HerculiTickCache cache = HERCULI_TICK_CACHE.get();
++        cache.refreshIfNeeded(level);
++
+         for (MobCategory mobCategory : SPAWNING_CATEGORIES) {
+             // CraftBukkit start - Use per-world spawn limits
+             boolean spawnThisTick = true;
+@@ -136,6 +169,11 @@ public final class NaturalSpawner {
+                 limit = level.getWorld().getSpawnLimit(spawnCategory);
+             }
+ 
++            // Herculi: spawn pressure scaling (config-gated)
++            if (cache.spawnPressureEnabled) {
++                limit = (int)Math.floor((long)limit * (long)cache.spawnPressurePercent / 100L);
++            }
++
+             if (!spawnThisTick || limit == 0) {
+                 continue;
+             }
+@@ -165,6 +203,9 @@ public final class NaturalSpawner {
+             }
+         }
+ 
++        final HerculiTickCache cache = HERCULI_TICK_CACHE.get();
++        cache.refreshIfNeeded(level);
++
+         for (MobCategory mobCategory : categories) {
+             // Herculi: run custom spawners (default-off if registry empty)
+             if (CustomSpawnerRegistry.instance().hasSpawners()) {
+@@ -193,6 +234,10 @@ public final class NaturalSpawner {
+                 }
+ 
+                 maxSpawns = (minDiff == Integer.MAX_VALUE) ? 0 : minDiff;
++                // Herculi: spawn pressure scaling for per-player path
++                if (cache.spawnPressureEnabled && maxSpawns != Integer.MAX_VALUE) {
++                    maxSpawns = (int)Math.floor((long)maxSpawns * (long)cache.spawnPressurePercent / 100L);
++                }
+                 canSpawn = maxSpawns > 0;
+             } else {
+                 canSpawn = spawnState.canSpawnForCategoryLocal(mobCategory, chunk.getPos());
+@@ -261,12 +306,17 @@ public final class NaturalSpawner {
+             if (maxSpawns <= 0) {
+                 return;
+             }
+-            // Herculi: per-call cache for mobsAt() to avoid repeated biome/structure lookups within this loop
+-            final java.util.HashMap<Long, net.minecraft.util.random.WeightedList<MobSpawnSettings.SpawnerData>> herculi_mobsAtCache = new java.util.HashMap<>(8);
++            // Herculi: per-call cache for mobsAt() to avoid repeated biome/structure lookups within this loop (fastutil for speed)
++            final it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<net.minecraft.util.random.WeightedList<MobSpawnSettings.SpawnerData>> herculi_mobsAtCache = new it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<>(8);
+             BlockPos.MutableBlockPos mutableBlockPos = new BlockPos.MutableBlockPos();
+             int i = 0;
++            // Herculi: spawn pressure caps (from tick cache)
++            final HerculiTickCache cache = HERCULI_TICK_CACHE.get();
++            cache.refreshIfNeeded(level);
++            final int herculi_maxGroups = cache.spawnPressureEnabled ? cache.spawnPressureMaxGroupsPerPos : 3;
++            final int herculi_maxAttemptsPerGroup = cache.spawnPressureEnabled ? cache.spawnPressureMaxAttemptsPerGroup : Integer.MAX_VALUE;
+ 
+-            for (int i1 = 0; i1 < 3; i1++) {
++            for (int i1 = 0; i1 < herculi_maxGroups; i1++) {
+                 int x = pos.getX();
+                 int z = pos.getZ();
+                 int i2 = 6;
+@@ -275,7 +325,14 @@ public final class NaturalSpawner {
+                 int ceil = Mth.ceil(level.random.nextFloat() * 4.0F);
+                 int i3 = 0;
+ 
++                int herculi_attempts = 0;
+                 for (int i4 = 0; i4 < ceil; i4++) {
++                    if (herculi_attempts >= herculi_maxAttemptsPerGroup) break; // cap attempts per group
++                    // Also cap by remaining capacity early to avoid wasted iterations
++                    final int remainingCap = Math.max(0, maxSpawns - i);
++                    if (remainingCap <= 0) {
++                        return;
++                    }
+                     x += level.random.nextInt(6) - level.random.nextInt(6);
+                     z += level.random.nextInt(6) - level.random.nextInt(6);
+                     mutableBlockPos.set(x, y, z);
+@@ -312,8 +369,8 @@ public final class NaturalSpawner {
+                         if (level.isLoadedAndInBounds(mutableBlockPos) && isRightDistanceToPlayerAndSpawnPoint(level, chunk, mutableBlockPos, d2)) { // Paper - don't load chunks for mob spawn
+                             if (spawnerData == null) {
+                                 // Use cached mobsAt() for this chunk/category combination
+-                                final ChunkPos cp = (chunk instanceof LevelChunk lc) ? lc.getPos() : new ChunkPos(mutableBlockPos);
+-                                final long key = (((long)category.ordinal()) << 56) ^ cp.toLong();
++                                final long cpLong = (chunk instanceof LevelChunk lc) ? lc.getPos().toLong() : new ChunkPos(mutableBlockPos).toLong();
++                                final long key = (((long)category.ordinal()) << 56) ^ cpLong;
+                                 net.minecraft.util.random.WeightedList<MobSpawnSettings.SpawnerData> table = herculi_mobsAtCache.get(key);
+                                 if (table == null) {
+                                     // Reduce biome lookup overhead: derive biome holder from chunk noise biome instead of level.getBiome
+@@ -338,7 +395,8 @@ public final class NaturalSpawner {
+                                 if (remaining <= 0) {
+                                     return;
+                                 }
+-                                ceil = Math.min(desired, remaining);
++                                // Also respect pressure attempt cap
++                                ceil = Math.min(Math.min(desired, remaining), herculi_maxAttemptsPerGroup);
+                             }
+ 
+                             // Paper start - PreCreatureSpawnEvent
+@@ -386,6 +444,8 @@ public final class NaturalSpawner {
+                                         break;
+                                     }
+                                 }
++                                // Count this attempt towards per-group cap even if it didn't spawn
++                                herculi_attempts++;
+                             }
+                         }
+                     }

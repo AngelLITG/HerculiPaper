@@ -24,18 +24,37 @@
 - **Thread-Safe Collections**: Concurrent entity maps, player tracking, and scoreboards
 - **Async Chunk Pipeline**: Non-blocking chunk loading and generation
 - **Safe Event Dispatch**: Bukkit events properly synchronized to main thread
+ - **PerThreadNeighborUpdater**: Thread-local wrapper for `NeighborUpdater` to avoid cross-thread races during redstone/shape updates
 
 ### Network Optimizations
 - **Threaded Broadcasting**: Parallel packet sending with recipient queues
 - **Packet Caching**: Reuse common packets across players
 - **Lazy Network Writes**: Batch and merge network operations
 - **Ping Deferral**: Reduce network overhead during high load
+ - **Fast Viewer Membership Map**: O(1) membership checks to cut CHM churn in tracking
 
 ### Entity Performance
 - **WeakSeqLock Integration**: Lock-free entity tracking snapshots
 - **Collision Pooling**: Thread-local allocation pools for collision detection
 - **Tracking Caps**: Configurable limits to prevent performance degradation
 - **Optimized Pathfinding**: Async pathfinding recalculation
+- **NaturalSpawner Hot Path Optimizations**: Early exits and reduced per-attempt work
+  - Hoisted per-group `NearbyPlayers` lookup and reused player array
+  - Per-invocation `mobsAt()` cache keyed by `(ChunkPos, category)`
+  - Capped initial random attempts by remaining capacity and attempt cap
+  - Early-return when `maxSpawns <= 0` and break when no players in view-distance
+- **AI Nearest-Player Fast Path**: `EntityGetter.getNearestPlayer(...)` and related queries backed by regionized `NearbyPlayers` where safe
+- **AI Tick Throttling**: Config-gated goal selector throttling for far entities (tick every 4th tick beyond threshold)
+- **Tracker Optimization Suite**:
+  - Replaced `ConcurrentHashMap` vanish cache with fastutil `Object2LongOpenHashMap`
+  - Batched viewer array rebuilds (immediate on ≥8 changes, deferred otherwise)
+  - Eliminated redundant map lookups in tracking hot path
+  - Skip tracking updates for stationary entities (moved <1.0 blocks)
+  - Skip tracking every other tick for far entities (>64 blocks from players)
+- **AI Query Caching**: 4-tick cache for nearest player lookups to reduce pathfinding overhead
+  - Used by TemptGoal and other AI goals that query for nearby players
+- **Player Block Check Optimization**: Skip expensive block intersection checks for stationary players (moved <0.1 blocks)
+- **Async Join Protocol Changes**: Eliminate main thread blocking during player joins (4ms/join → ~0ms)
 
 ### Monitoring & Diagnostics
 - **Built-in Profiler**: JFR integration and custom metrics
@@ -99,6 +118,13 @@ async.player_save.enabled: true                    # Non-blocking player saves
 async.player_save.pool_size: 2                     # Worker threads
 threading.chunk_io_enable: true                    # Async chunk I/O pipeline
 threading.chunk_io_max_inflight: 32                # Max parallel I/O
+
+# Entity tracking & AI optimizations
+entities.tracker.coalesce.enabled: true            # Coalesce packets for far viewers
+entities.tracker.coalesce.farDistance: 96          # Distance threshold (blocks)
+entities.tracker.coalesce.interval: 3              # Send to far viewers every N ticks
+entities.ai.throttle.enabled: true                 # Throttle AI for far entities
+entities.ai.throttle.distanceSq: 4096              # Distance² threshold (64²)
 ```
 
 #### 🔍 Monitoring
