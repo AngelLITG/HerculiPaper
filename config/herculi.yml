@@ -3,69 +3,175 @@
 # This configuration is optimized for high player count servers (1000+ players)
 # while preserving vanilla-like gameplay experience and maintaining 20 TPS
 
-# Threading and regionization - ENABLED for performance
+# Threading and regionization - ENABLED by default
 threading.enabled: true
-threading.region_pool_size: 0 # 0 = auto (CPU count) - recommended for optimal performance
-threading.region_shift: 4      # 16x16 chunks per region - good balance for player distribution
+threading.region_pool_size: 0  # 0 = auto (uses available cores)
+threading.region_shift: 7      # 128-block regions (16x16 chunks)
+threading.region_executor_idle_minutes: 10
+threading.region_executor_cleanup_check_enqueues: 200
 
-# Async chunk I/O pipeline - ENABLED for better I/O performance
+# Async chunk I/O pipeline - ENABLED by default
 threading.chunk_io_enable: true
-threading.chunk_io_max_inflight: 32  # Increased for higher throughput
+threading.chunk_io_max_inflight: 32
 
-# Networking options - ENABLED for better network performance
+# Handoff optimizations - ENABLED by default
+threading.handoff.enabled: true
+threading.handoff.sounds: true
+threading.handoff.particles: true
+threading.handoff.tracker_packets: true
+threading.handoff.debug: false
+
+# Level random precompute - ENABLED by default
+threading.random_precompute.enabled: true
+
+# Networking options - ENABLED by default
 networking.parallel_flush_enabled: true
+networking.write.lazyExecute.enabled: true
+networking.fencing.enabled: true
+networking.fencing.debug: false
 networking.ping.defer.enabled: true
 networking.ping.defer.ticks: 1
+networking.async_join_protocol: true
 
-# Threaded broadcasting - ENABLED for packet performance with 1000+ players
-broadcasting.threaded.enabled: true
-broadcasting.threaded.perRecipientQueues: true
-broadcasting.threaded.maxQueuesTotal: 50000  # Increased for 1000+ players
-broadcasting.threaded.maxQueuesPerPlayer: 1024  # Higher limit per player
-broadcasting.threaded.maxBatchesPerQueue: 128   # Larger batches for efficiency
-broadcasting.threaded.dropPolicy: coalesce      # Coalesce for performance
-broadcasting.threaded.drainIntervalMs: 1        # More frequent draining
-broadcasting.threaded.drainBudget: 256          # Higher budget for throughput
+# Async player save I/O - ENABLED by default
+async.player_save.enabled: true
+async.player_save.pool_size: 1
 
-# Portals/teleportation routing - ENABLED for async teleports
+# Entity activation optimizations
+activation.check_immunities_interval: 20
+
+# Redstone optimizations - ENABLED by default
+redstone.ac.enabled: true
+redstone.wire.turbo.enabled: true
+redstone.threadsafe_neighbors.enabled: true
+
+# Potential calculator optimization - ENABLED by default
+potential.cache.enabled: true
+potential.cache.size: 4096
+
+# World init sequencing
+world.init.attach_global_scheduler.enabled: true
+world.init.attach_global_scheduler.log: true
+
+# Fireworks cleanup on owner detach/teleport
+fireworks.cleanup.on_owner_removed: true
+fireworks.cleanup.on_world_mismatch: true
+
+# Region guards - DISABLED by default
+regions.boundary.enforce.enabled: false
+regions.boundary.log: true
+regions.actions.same_region_only.enabled: false
+regions.actions.same_region_only.log: true
+
+# Entity tracker caps
+entities.tracker.max_per_entity: 512
+entities.tracker.cap.log: true
+entities.tracker.hysteresis.blocks: 32
+entities.tracker.vanish.cache.enabled: true
+
+# Entity tracker packet coalescing - ENABLED by default
+entities.tracker.coalesce.enabled: true
+entities.tracker.coalesce.farDistance: 96
+entities.tracker.coalesce.interval: 4
+
+# AI throttling - ENABLED by default
+entities.ai.throttle.enabled: true
+entities.ai.throttle.distanceSq: 4096
+
+# Spawn pressure controls - ENABLED by default
+spawning.mob_pressure.enabled: true
+spawning.mob_pressure.per_category_limit_percent: 70
+spawning.mob_pressure.max_groups_per_pos: 2
+spawning.mob_pressure.max_attempts_per_group: 2
+
+# Portals/teleportation routing - ENABLED by default
 portals.routing_enabled: true
 
-# Profiling/diagnostics - ENABLED for monitoring
+# Profiling/diagnostics - ENABLED by default
 profiling.enabled: true
 
-# Guardrails - ENABLED for safety in production
+# Commands
+commands.marshalPerTarget: true
+commands.marshalDebug: false
+
+# Guardrails - ENABLED by default
 guardrails.enabled: true
-guardrails.networking.logOffThread: false  # Disable noisy logs in production
+guardrails.networking.logOffThread: false
+teleport.enforce_main_thread: true
 
-# Handoff optimizations - ENABLED for performance
-threading.handoff.enabled: true            # master switch - ENABLED
-threading.handoff.sounds: true             # handoff playSound() calls - reduces main thread load
-threading.handoff.particles: true          # handoff spawnParticle() calls - reduces main thread load
-threading.handoff.tracker_packets: true    # emit tracker packets via region scheduler
-threading.handoff.debug: false             # keep debug off in production
+# Instrumentation toggles - ENABLED by default
+instrumentation.unload.metrics_enabled: true
+instrumentation.block_entities.metrics_enabled: true
 
-# Fairness system - ENABLED for balanced resource allocation
+# Threaded broadcasting - ENABLED by default
+broadcasting.threaded.enabled: true
+broadcasting.threaded.maxBatchesPerQueue: 128
+broadcasting.threaded.perTickDrainBudget: 256
+broadcasting.threaded.maxQueuesTotal: 50000
+broadcasting.threaded.dropPolicy: coalesce
+broadcasting.threaded.debug: false
+
+# Tracking caps
+tracking.max_trackers_per_entity: 0
+tracking.max_trackers_heavy: 0
+tracking.heavy_types: ITEM,PROJECTILE
+
+# Pathfinding recalculation - ENABLED by default
+pathfinding.recalc.enabled: true
+pathfinding.recalc.minIntervalTicks: 5
+pathfinding.recalc.jitterTicks: 2
+pathfinding.recalc.debug: false
+
+# Villager sensors throttle - ENABLED by default
+villagers.sensors.throttle.enabled: true
+villagers.sensors.throttle.minIntervalTicks: 10
+villagers.sensors.throttle.jitterTicks: 2
+villagers.sensors.debug: false
+
+# Fairness budgets - ENABLED by default
 fairness.enabled: true
-fairness.broadcast_drain_budget: 512        # Higher budget for 1000+ players
-fairness.region_task_budget: 256            # Balanced region task processing
+fairness.broadcastDrain.budget: 512
+fairness.diagnosticsDrain.budget: 32
+fairness.asyncCompletions.budget: 64
+fairness.debug: false
 
-# Entity optimizations - ENABLED for better entity performance
-entities.tracking.cap_enabled: true         # Enable tracking caps
-entities.tracking.max_per_player: 512       # Reasonable limit per player
+# Prefetch - ENABLED by default
+prefetch.enabled: true
+prefetch.steps: 2
+prefetch.max_per_tick: 4
+prefetch.min_speed_blocks_per_tick: 0.05
 
-# Block entity optimizations - ENABLED for better tile entity performance
-block_entities.metrics_enabled: true        # Monitor block entity performance
-block_entities.tick_budget: 1000            # Microsecond budget per tick
+# ======================================================================
+# LEGACY/UNUSED KEYS (kept for reference, not actively used in code)
+# ======================================================================
 
-# Player save optimizations - ENABLED for async saves
-player_saves.async_enabled: true            # Async player saves
-player_saves.batch_size: 16                 # Batch multiple saves
+# Broadcasting - unused specific settings (only perTickDrainBudget is used)
+broadcasting.threaded.perRecipientQueues: true
+broadcasting.threaded.maxQueuesPerPlayer: 1024
+broadcasting.threaded.drainIntervalMs: 1
+broadcasting.threaded.drainBudget: 256
 
-# Chunk optimizations
-chunks.unload_metrics_enabled: true         # Monitor chunk unload performance
-chunks.precompute_enabled: true             # Enable random precomputation
+# Fairness - unused underscore variants (camelCase versions are used)
+fairness.broadcast_drain_budget: 512
+fairness.region_task_budget: 256
 
-# Network optimizations for high player count
-networking.lazy_writes_enabled: true        # Reduce network overhead
-networking.flush_merging_enabled: true      # Merge network flushes
-networking.packet_caching_enabled: true     # Cache common packets
+# Entity tracking - unused underscore variants
+entities.tracking.cap_enabled: true
+entities.tracking.max_per_player: 512
+
+# Block entities - unused underscore variants
+block_entities.metrics_enabled: true
+block_entities.tick_budget: 1000
+
+# Player saves - unused underscore variants (async.player_save.* is used)
+player_saves.async_enabled: true
+player_saves.batch_size: 16
+
+# Chunks - unused underscore variants
+chunks.unload_metrics_enabled: true
+chunks.precompute_enabled: true
+
+# Networking - unused feature flags (not implemented)
+networking.lazy_writes_enabled: true
+networking.flush_merging_enabled: true
+networking.packet_caching_enabled: true
