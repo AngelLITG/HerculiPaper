@@ -1,0 +1,543 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Angel <achaparro@lifeisthegame.email>
+Date: Fri, 17 Oct 2025 09:20:34 -0500
+Subject: [PATCH] Default Config
+
+
+diff --git a/src/main/java/io/multipaper/herculi/config/HerculiConfig.java b/src/main/java/io/multipaper/herculi/config/HerculiConfig.java
+index b8d87a394b74958471495015968b83330a816e2c..6dd8d2fee8cf0a992240fd5bf01edd1b193f3d1f 100644
+--- a/src/main/java/io/multipaper/herculi/config/HerculiConfig.java
++++ b/src/main/java/io/multipaper/herculi/config/HerculiConfig.java
+@@ -20,41 +20,75 @@ public final class HerculiConfig {
+     // Public API
+     // Multithreaded server: always true
+     public boolean threadingEnabled() { return true; }
+-    public boolean handoffEnabled() { return getBoolean("threading.handoff.enabled", false); }
+-    public boolean handoffSoundsEnabled() { return getBoolean("threading.handoff.sounds", false); }
+-    public boolean handoffParticlesEnabled() { return getBoolean("threading.handoff.particles", false); }
+-    public boolean handoffTrackerPacketsEnabled() { return getBoolean("threading.handoff.tracker_packets", false); }
++    public boolean handoffEnabled() { return getBoolean("threading.handoff.enabled", true); }
++    public boolean handoffSoundsEnabled() { return getBoolean("threading.handoff.sounds", true); }
++    public boolean handoffParticlesEnabled() { return getBoolean("threading.handoff.particles", true); }
++    public boolean handoffTrackerPacketsEnabled() { return getBoolean("threading.handoff.tracker_packets", true); }
+     public boolean handoffDebugEnabled() { return getBoolean("threading.handoff.debug", false); }
+     // Guardrails & teleport enforcement gates (default ON)
+     public boolean guardrailsEnabled() { return getBoolean("guardrails.enabled", true); }
++    public boolean guardrailsNetworkingLogOffThread() { return getBoolean("guardrails.networking.logOffThread", false); }
+     public boolean teleportEnforceMainThread() { return getBoolean("teleport.enforce_main_thread", true); }
+-    public boolean networkingParallelFlushEnabled() { return getBoolean("networking.parallel_flush_enabled", false); }
+-    public boolean networkFencingEnabled() { return getBoolean("networking.fencing.enabled", false); }
++    public boolean networkingParallelFlushEnabled() { return getBoolean("networking.parallel_flush_enabled", true); }
++    public boolean networkFencingEnabled() { return getBoolean("networking.fencing.enabled", true); }
+     public boolean networkFencingDebug() { return getBoolean("networking.fencing.debug", false); }
+-    public boolean portalRoutingEnabled() { return getBoolean("portals.routing_enabled", false); }
+-    public boolean profilingEnabled() { return getBoolean("profiling.enabled", false); }
+-    public boolean marshalPerTarget() { return getBoolean("commands.marshalPerTarget", false); }
++    public boolean portalRoutingEnabled() { return getBoolean("portals.routing_enabled", true); }
++    public boolean profilingEnabled() { return getBoolean("profiling.enabled", true); }
++    public boolean marshalPerTarget() { return getBoolean("commands.marshalPerTarget", true); }
+     public boolean marshalDebug() { return getBoolean("commands.marshalDebug", false); }
+-    // Level random precompute (default-off)
+-    public boolean randomPrecomputeEnabled() { return getBoolean("threading.random_precompute.enabled", false); }
+-    // Instrumentation (default-off)
+-    public boolean instrumentationUnloadMetricsEnabled() { return getBoolean("instrumentation.unload.metrics_enabled", false); }
+-    public boolean instrumentationBlockEntityMetricsEnabled() { return getBoolean("instrumentation.block_entities.metrics_enabled", false); }
++    // Level random precompute (default ON)
++    public boolean randomPrecomputeEnabled() { return getBoolean("threading.random_precompute.enabled", true); }
++    // Instrumentation (default ON)
++    public boolean instrumentationUnloadMetricsEnabled() { return getBoolean("instrumentation.unload.metrics_enabled", true); }
++    public boolean instrumentationBlockEntityMetricsEnabled() { return getBoolean("instrumentation.block_entities.metrics_enabled", true); }
+     public int threadingRegionPoolSize() { return Math.max(0, getInt("threading.region_pool_size", 0)); }
++    public boolean networkingWriteLazyExecuteEnabled() { return getBoolean("networking.write.lazyExecute.enabled", true); }
++    public boolean networkingAsyncJoinProtocol() { return getBoolean("networking.async_join_protocol", true); }
++    public boolean networkingPingDeferEnabled() { return getBoolean("networking.ping.defer.enabled", true); }
++    public int networkingPingDeferTicks() { return Math.max(1, getInt("networking.ping.defer.ticks", 1)); }
++    public boolean asyncPlayerSaveEnabled() { return getBoolean("async.player_save.enabled", true); }
++    public int asyncPlayerSavePoolSize() { return Math.max(1, getInt("async.player_save.pool_size", 1)); }
++    public int activationCheckImmunitiesInterval() { return Math.max(1, getInt("activation.check_immunities_interval", 20)); }
++    public boolean redstoneAcEnabled() { return getBoolean("redstone.ac.enabled", true); }
++    public boolean redstoneWireTurboEnabled() { return getBoolean("redstone.wire.turbo.enabled", true); }
++    public boolean redstoneThreadsafeNeighborsEnabled() { return getBoolean("redstone.threadsafe_neighbors.enabled", true); }
++    public boolean potentialCacheEnabled() { return getBoolean("potential.cache.enabled", true); }
++    public int potentialCacheSize() { return Math.max(1, getInt("potential.cache.size", 4096)); }
++    public boolean worldInitAttachGlobalSchedulerEnabled() { return getBoolean("world.init.attach_global_scheduler.enabled", true); }
++    public boolean worldInitAttachGlobalSchedulerLog() { return getBoolean("world.init.attach_global_scheduler.log", true); }
++    public boolean fireworksCleanupOnOwnerRemoved() { return getBoolean("fireworks.cleanup.on_owner_removed", true); }
++    public boolean fireworksCleanupOnWorldMismatch() { return getBoolean("fireworks.cleanup.on_world_mismatch", true); }
++    public boolean regionsBoundaryEnforceEnabled() { return getBoolean("regions.boundary.enforce.enabled", false); }
++    public boolean regionsBoundaryLog() { return getBoolean("regions.boundary.log", true); }
++    public boolean regionsActionsSameRegionOnlyEnabled() { return getBoolean("regions.actions.same_region_only.enabled", false); }
++    public boolean regionsActionsSameRegionOnlyLog() { return getBoolean("regions.actions.same_region_only.log", true); }
++    public int entitiesTrackerMaxPerEntity() { return Math.max(1, getInt("entities.tracker.max_per_entity", 512)); }
++    public boolean entitiesTrackerCapLog() { return getBoolean("entities.tracker.cap.log", true); }
++    public boolean entitiesTrackerVanishCacheEnabled() { return getBoolean("entities.tracker.vanish.cache.enabled", true); }
++    public boolean entitiesAiThrottleEnabled() { return getBoolean("entities.ai.throttle.enabled", true); }
++    public int entitiesAiThrottleDistanceSq() { return Math.max(0, getInt("entities.ai.throttle.distanceSq", 4096)); }
++    public int trackingMaxTrackersPerEntity() { return Math.max(0, getInt("tracking.max_trackers_per_entity", 0)); }
++    public int trackingMaxTrackersHeavy() { return Math.max(0, getInt("tracking.max_trackers_heavy", 0)); }
++    public String trackingHeavyTypes() { return getString("tracking.heavy_types", "ITEM,PROJECTILE"); }
++    public boolean broadcastingThreadedDebug() { return getBoolean("broadcasting.threaded.debug", false); }
++    public boolean prefetchEnabled() { return getBoolean("prefetch.enabled", true); }
++    public int prefetchSteps() { return Math.max(1, getInt("prefetch.steps", 2)); }
++    public int prefetchMaxPerTick() { return Math.max(1, getInt("prefetch.max_per_tick", 4)); }
++    public double prefetchMinSpeedBlocksPerTick() { return Math.max(0.0, getDouble("prefetch.min_speed_blocks_per_tick", 0.05)); }
+     // Cache frequently accessed values to avoid hot path parsing
+     private volatile int cachedRegionShift = -1;
+     public int threadingRegionShift() { 
+         int cached = this.cachedRegionShift;
+         if (cached == -1) {
+-            cached = Math.max(0, getInt("threading.region_shift", 4));
++            cached = Math.max(0, getInt("threading.region_shift", 7));
+             this.cachedRegionShift = cached;
+         }
+         return cached;
+     }
+     public int threadingRegionExecutorIdleMinutes() { return Math.max(1, getInt("threading.region_executor_idle_minutes", 10)); }
+     public int threadingRegionExecutorCleanupEveryEnqueues() { return Math.max(10, getInt("threading.region_executor_cleanup_check_enqueues", 200)); }
+-    public boolean chunkIoEnabled() { return getBoolean("threading.chunk_io_enable", false); }
+-    public int chunkIoMaxInflight() { return Math.max(1, getInt("threading.chunk_io_max_inflight", 16)); }
++    public boolean chunkIoEnabled() { return getBoolean("threading.chunk_io_enable", true); }
++    public int chunkIoMaxInflight() { return Math.max(1, getInt("threading.chunk_io_max_inflight", 32)); }
+ 
+     public void reload() {
+         this.loaded = false;
+@@ -111,33 +145,34 @@ public final class HerculiConfig {
+                     if (!java.nio.file.Files.exists(cfgFile)) {
+                         final String scaffold = "# Herculi configuration\n"
+                             + "# Minimal key: value format. Unknown keys are ignored.\n\n"
+-                            + "# Threading and regionization\n"
++                            + "# Threading and regionization - ENABLED by default\n"
+                             + "threading.enabled: true\n"
+                             + "threading.region_pool_size: 0\n"
+-                            + "threading.region_shift: 4\n"
++                            + "threading.region_shift: 7\n"
+                             + "threading.region_executor_idle_minutes: 10\n"
+                             + "threading.region_executor_cleanup_check_enqueues: 200\n\n"
+-                            + "# Async chunk I/O pipeline\n"
+-                            + "threading.chunk_io_enable: false\n"
+-                            + "threading.chunk_io_max_inflight: 16\n\n"
+-                            + "# Networking options\n"
+-                            + "networking.parallel_flush_enabled: false\n"
+-                            + "networking.write.lazyExecute.enabled: false\n"
+-                            + "networking.fencing.enabled: false\n"
+-                            + "networking.fencing.debug: false\n\n"
+-                            + "networking.ping.defer.enabled: false\n"
+-                            + "networking.ping.defer.ticks: 1\n\n"
+-                            + "# Async player save I/O\n"
+-                            + "async.player_save.enabled: false\n"
++                            + "# Async chunk I/O pipeline - ENABLED by default\n"
++                            + "threading.chunk_io_enable: true\n"
++                            + "threading.chunk_io_max_inflight: 32\n\n"
++                            + "# Networking options - ENABLED by default\n"
++                            + "networking.parallel_flush_enabled: true\n"
++                            + "networking.write.lazyExecute.enabled: true\n"
++                            + "networking.fencing.enabled: true\n"
++                            + "networking.fencing.debug: false\n"
++                            + "networking.ping.defer.enabled: true\n"
++                            + "networking.ping.defer.ticks: 1\n"
++                            + "networking.async_join_protocol: true\n\n"
++                            + "# Async player save I/O - ENABLED by default\n"
++                            + "async.player_save.enabled: true\n"
+                             + "async.player_save.pool_size: 1\n\n"
+                             + "# Entity activation optimizations\n"
+                             + "activation.check_immunities_interval: 20\n\n"
+-                            + "# Redstone optimizations\n"
+-                            + "redstone.ac.enabled: false\n"
+-                            + "redstone.wire.turbo.enabled: false\n"
+-                            + "redstone.threadsafe_neighbors.enabled: false\n\n"
+-                            + "# Potential calculator optimization\n"
+-                            + "potential.cache.enabled: false\n"
++                            + "# Redstone optimizations - ENABLED by default\n"
++                            + "redstone.ac.enabled: true\n"
++                            + "redstone.wire.turbo.enabled: true\n"
++                            + "redstone.threadsafe_neighbors.enabled: true\n\n"
++                            + "# Potential calculator optimization - ENABLED by default\n"
++                            + "potential.cache.enabled: true\n"
+                             + "potential.cache.size: 4096\n\n"
+                             + "# World init sequencing\n"
+                             + "world.init.attach_global_scheduler.enabled: true\n"
+@@ -145,53 +180,82 @@ public final class HerculiConfig {
+                             + "# Fireworks cleanup on owner detach/teleport\n"
+                             + "fireworks.cleanup.on_owner_removed: true\n"
+                             + "fireworks.cleanup.on_world_mismatch: true\n\n"
+-                            + "# Region guards\n"
++                            + "# Region guards - DISABLED by default\n"
+                             + "regions.boundary.enforce.enabled: false\n"
+                             + "regions.boundary.log: true\n"
+-                            + "regions.actions.same_region_only.enabled: true\n"
+-                            + "regions.actions.same_region_only.log: false\n\n"
++                            + "regions.actions.same_region_only.enabled: false\n"
++                            + "regions.actions.same_region_only.log: true\n\n"
+                             + "# Entity tracker caps\n"
+                             + "entities.tracker.max_per_entity: 512\n"
+-                            + "entities.tracker.cap.log: true\n\n"
+-                            + "# Spawn pressure controls (default-off)\n"
+-                            + "spawning.mob_pressure.enabled: false\n"
+-                            + "spawning.mob_pressure.per_category_limit_percent: 100\n"
+-                            + "spawning.mob_pressure.max_groups_per_pos: 3\n"
+-                            + "spawning.mob_pressure.max_attempts_per_group: 4\n\n"
+-                            + "# Entity tracker packet coalescing (default-off)\n"
+-                            + "entities.tracker.coalesce.enabled: false\n"
+-                            + "entities.tracker.coalesce.farDistance: 96\n"
+-                            + "entities.tracker.coalesce.interval: 3\n\n"
+-                            + "# Vanish optimization\n"
++                            + "entities.tracker.cap.log: true\n"
++                            + "entities.tracker.hysteresis.blocks: 32\n"
+                             + "entities.tracker.vanish.cache.enabled: true\n\n"
+-                            + "# Portals/teleportation routing\n"
+-                            + "portals.routing_enabled: false\n\n"
+-                            + "# Profiling/diagnostics\n"
+-                            + "profiling.enabled: false\n\n"
++                            + "# Spawn pressure controls - ENABLED by default\n"
++                            + "spawning.mob_pressure.enabled: true\n"
++                            + "spawning.mob_pressure.per_category_limit_percent: 70\n"
++                            + "spawning.mob_pressure.max_groups_per_pos: 2\n"
++                            + "spawning.mob_pressure.max_attempts_per_group: 2\n\n"
++                            + "# Entity tracker packet coalescing - ENABLED by default\n"
++                            + "entities.tracker.coalesce.enabled: true\n"
++                            + "entities.tracker.coalesce.farDistance: 96\n"
++                            + "entities.tracker.coalesce.interval: 4\n\n"
++                            + "# AI throttling - ENABLED by default\n"
++                            + "entities.ai.throttle.enabled: true\n"
++                            + "entities.ai.throttle.distanceSq: 4096\n\n"
++                            + "# Portals/teleportation routing - ENABLED by default\n"
++                            + "portals.routing_enabled: true\n\n"
++                            + "# Profiling/diagnostics - ENABLED by default\n"
++                            + "profiling.enabled: true\n\n"
+                             + "# Commands\n"
+-                            + "commands.marshalPerTarget: false\n"
++                            + "commands.marshalPerTarget: true\n"
+                             + "commands.marshalDebug: false\n\n"
+-                            + "# Guardrails (default-on).\n"
++                            + "# Guardrails - ENABLED by default\n"
+                             + "guardrails.enabled: true\n"
++                            + "guardrails.networking.logOffThread: false\n"
+                             + "teleport.enforce_main_thread: true\n\n"
+-                            + "# Handoff (default-off).\n"
+-                            + "threading.handoff.enabled: false\n"
+-                            + "threading.handoff.sounds: false\n"
+-                            + "threading.handoff.particles: false\n"
+-                            + "threading.handoff.tracker_packets: false\n"
++                            + "# Handoff optimizations - ENABLED by default\n"
++                            + "threading.handoff.enabled: true\n"
++                            + "threading.handoff.sounds: true\n"
++                            + "threading.handoff.particles: true\n"
++                            + "threading.handoff.tracker_packets: true\n"
+                             + "threading.handoff.debug: false\n\n"
+-                            + "# Level random tick read-only precompute (default-off)\n"
+-                            + "threading.random_precompute.enabled: false\n\n"
+-                            + "# Instrumentation toggles (default-off)\n"
+-                            + "instrumentation.unload.metrics_enabled: false\n"
+-                            + "instrumentation.block_entities.metrics_enabled: false\n"
+-                            + "\n# Threaded broadcasting (default-off)\n"
+-                            + "broadcasting.threaded.enabled: false\n"
+-                            + "broadcasting.threaded.maxBatchesPerQueue: 16\n"
+-                            + "broadcasting.threaded.perTickDrainBudget: 4\n"
+-                            + "broadcasting.threaded.maxQueuesTotal: 20000\n"
++                            + "# Level random precompute - ENABLED by default\n"
++                            + "threading.random_precompute.enabled: true\n\n"
++                            + "# Instrumentation toggles - ENABLED by default\n"
++                            + "instrumentation.unload.metrics_enabled: true\n"
++                            + "instrumentation.block_entities.metrics_enabled: true\n\n"
++                            + "# Threaded broadcasting - ENABLED by default\n"
++                            + "broadcasting.threaded.enabled: true\n"
++                            + "broadcasting.threaded.maxBatchesPerQueue: 128\n"
++                            + "broadcasting.threaded.perTickDrainBudget: 256\n"
++                            + "broadcasting.threaded.maxQueuesTotal: 50000\n"
+                             + "broadcasting.threaded.dropPolicy: coalesce\n"
+-                            + "broadcasting.threaded.drainIntervalMs: 2\n"
++                            + "broadcasting.threaded.debug: false\n\n"
++                            + "# Tracking caps\n"
++                            + "tracking.max_trackers_per_entity: 0\n"
++                            + "tracking.max_trackers_heavy: 0\n"
++                            + "tracking.heavy_types: ITEM,PROJECTILE\n\n"
++                            + "# Pathfinding recalculation - ENABLED by default\n"
++                            + "pathfinding.recalc.enabled: true\n"
++                            + "pathfinding.recalc.minIntervalTicks: 5\n"
++                            + "pathfinding.recalc.jitterTicks: 2\n"
++                            + "pathfinding.recalc.debug: false\n\n"
++                            + "# Villager sensors throttle - ENABLED by default\n"
++                            + "villagers.sensors.throttle.enabled: true\n"
++                            + "villagers.sensors.throttle.minIntervalTicks: 10\n"
++                            + "villagers.sensors.throttle.jitterTicks: 2\n"
++                            + "villagers.sensors.debug: false\n\n"
++                            + "# Fairness budgets - ENABLED by default\n"
++                            + "fairness.enabled: true\n"
++                            + "fairness.broadcastDrain.budget: 512\n"
++                            + "fairness.diagnosticsDrain.budget: 32\n"
++                            + "fairness.asyncCompletions.budget: 64\n"
++                            + "fairness.debug: false\n\n"
++                            + "# Prefetch - ENABLED by default\n"
++                            + "prefetch.enabled: true\n"
++                            + "prefetch.steps: 2\n"
++                            + "prefetch.max_per_tick: 4\n"
++                            + "prefetch.min_speed_blocks_per_tick: 0.05\n"
+ ;
+                             
+                         java.nio.file.Files.writeString(cfgFile, scaffold);
+@@ -253,131 +317,195 @@ public final class HerculiConfig {
+         return v == null ? def : v;
+     }
+ 
++    public double getDouble(String key, double def) {
++        ensureLoaded();
++        String v = this.values.get(key);
++        if (v == null) return def;
++        try {
++            return Double.parseDouble(v.trim());
++        } catch (Throwable ignored) {
++            return def;
++        }
++    }
++
+     
+ 
+     private java.util.Map<String, String> defaultEntries() {
+         java.util.Map<String, String> m = new java.util.LinkedHashMap<>();
++        // Threading and regionization - ENABLED by default
+         m.put("threading.enabled", "true");
+-        m.put("threading.region_pool_size", "0");
+-        m.put("threading.region_shift", "4");
++        m.put("threading.region_pool_size", "0"); // 0 = auto (uses available cores)
++        m.put("threading.region_shift", "7"); // 128-block regions (16x16 chunks)
+         m.put("threading.region_executor_idle_minutes", "10");
+         m.put("threading.region_executor_cleanup_check_enqueues", "200");
+-        m.put("threading.chunk_io_enable", "false");
+-        m.put("threading.chunk_io_max_inflight", "16");
+-        m.put("networking.parallel_flush_enabled", "false");
+-        m.put("networking.write.lazyExecute.enabled", "false");
+-        m.put("networking.fencing.enabled", "false");
++        m.put("threading.chunk_io_enable", "true");
++        m.put("threading.chunk_io_max_inflight", "32");
++        
++        // Networking optimizations - ENABLED by default
++        m.put("networking.parallel_flush_enabled", "true");
++        m.put("networking.write.lazyExecute.enabled", "true");
++        m.put("networking.fencing.enabled", "true");
+         m.put("networking.fencing.debug", "false");
+-        m.put("networking.ping.defer.enabled", "false");
++        m.put("networking.ping.defer.enabled", "true");
+         m.put("networking.ping.defer.ticks", "1");
+-        m.put("networking.async_join_protocol", "true"); // Herculi: Async protocol changes during join
+-        m.put("async.player_save.enabled", "false");
++        m.put("networking.async_join_protocol", "true");
++        
++        // Async player saves - ENABLED by default
++        m.put("async.player_save.enabled", "true");
+         m.put("async.player_save.pool_size", "1");
++        
++        // Entity activation
+         m.put("activation.check_immunities_interval", "20");
+-        m.put("redstone.ac.enabled", "false");
+-        m.put("redstone.wire.turbo.enabled", "false");
+-        m.put("redstone.threadsafe_neighbors.enabled", "false");
+-        m.put("potential.cache.enabled", "false");
++        
++        // Redstone optimizations - ENABLED by default
++        m.put("redstone.ac.enabled", "true");
++        m.put("redstone.wire.turbo.enabled", "true");
++        m.put("redstone.threadsafe_neighbors.enabled", "true");
++        
++        // Potential cache - ENABLED by default
++        m.put("potential.cache.enabled", "true");
+         m.put("potential.cache.size", "4096");
++        
++        // World init
+         m.put("world.init.attach_global_scheduler.enabled", "true");
+         m.put("world.init.attach_global_scheduler.log", "true");
++        
++        // Fireworks cleanup
+         m.put("fireworks.cleanup.on_owner_removed", "true");
+         m.put("fireworks.cleanup.on_world_mismatch", "true");
++        
++        // Region boundaries - DISABLED by default (can cause issues)
+         m.put("regions.boundary.enforce.enabled", "false");
+         m.put("regions.boundary.log", "true");
+-        m.put("regions.actions.same_region_only.enabled", "true");
+-        m.put("regions.actions.same_region_only.log", "false");
++        m.put("regions.actions.same_region_only.enabled", "false");
++        m.put("regions.actions.same_region_only.log", "true");
++        
++        // Entity tracker
+         m.put("entities.tracker.max_per_entity", "512");
+         m.put("entities.tracker.cap.log", "true");
+-        m.put("entities.tracker.hysteresis.blocks", "24");
+-        // Spawn pressure (default-off)
+-        m.put("spawning.mob_pressure.enabled", "false");
+-        m.put("spawning.mob_pressure.per_category_limit_percent", "100");
+-        m.put("spawning.mob_pressure.max_groups_per_pos", "3");
+-        m.put("spawning.mob_pressure.max_attempts_per_group", "4");
+-        // Tracker packet coalescing (default-off)
+-        m.put("entities.tracker.coalesce.enabled", "false");
+-        m.put("entities.tracker.coalesce.farDistance", "96");
+-        m.put("entities.tracker.coalesce.interval", "3");
++        m.put("entities.tracker.hysteresis.blocks", "32");
+         m.put("entities.tracker.vanish.cache.enabled", "true");
+-        m.put("portals.routing_enabled", "false");
+-        m.put("profiling.enabled", "false");
+-        m.put("commands.marshalPerTarget", "false");
+-        m.put("commands.marshalDebug", "false");
++        
++        // Spawn pressure - ENABLED by default
++        m.put("spawning.mob_pressure.enabled", "true");
++        m.put("spawning.mob_pressure.per_category_limit_percent", "70");
++        m.put("spawning.mob_pressure.max_groups_per_pos", "2");
++        m.put("spawning.mob_pressure.max_attempts_per_group", "2");
++        
++        // Tracker packet coalescing - ENABLED by default
++        m.put("entities.tracker.coalesce.enabled", "true");
++        m.put("entities.tracker.coalesce.farDistance", "96");
++        m.put("entities.tracker.coalesce.interval", "4");
++        
++        // AI throttling - ENABLED by default
++        m.put("entities.ai.throttle.enabled", "true");
++        m.put("entities.ai.throttle.distanceSq", "4096");
++        
++        // Portal routing - ENABLED by default
++        m.put("portals.routing_enabled", "true");
++        
++        // Profiling - ENABLED by default
++        m.put("profiling.enabled", "true");
++        
++        // Commands
++        m.put("commands.marshalPerTarget", "true");
++        m.put("commands.marshalDebug", "false"); // debug = false
++        
++        // Guardrails - ENABLED by default
+         m.put("guardrails.enabled", "true");
++        m.put("guardrails.networking.logOffThread", "false");
+         m.put("teleport.enforce_main_thread", "true");
+-        m.put("threading.handoff.enabled", "false");
+-        m.put("threading.handoff.sounds", "false");
+-        m.put("threading.handoff.particles", "false");
+-        m.put("threading.handoff.tracker_packets", "false");
+-        m.put("threading.handoff.debug", "false");
+-        // Level random tick read-only precompute (default-off)
+-        m.put("threading.random_precompute.enabled", "false");
+-        // Instrumentation toggles (default-off)
+-        m.put("instrumentation.unload.metrics_enabled", "false");
+-        m.put("instrumentation.block_entities.metrics_enabled", "false");
+-        // Threaded broadcasting (default-off)
+-        m.put("broadcasting.threaded.enabled", "false");
+-        m.put("broadcasting.threaded.maxBatchesPerQueue", "16");
+-        m.put("broadcasting.threaded.perTickDrainBudget", "4");
+-        // Tracking caps (default-off)
++        
++        // Handoff optimizations - ENABLED by default
++        m.put("threading.handoff.enabled", "true");
++        m.put("threading.handoff.sounds", "true");
++        m.put("threading.handoff.particles", "true");
++        m.put("threading.handoff.tracker_packets", "true");
++        m.put("threading.handoff.debug", "false"); // debug = false
++        
++        // Level random precompute - ENABLED by default
++        m.put("threading.random_precompute.enabled", "true");
++        
++        // Instrumentation - ENABLED by default
++        m.put("instrumentation.unload.metrics_enabled", "true");
++        m.put("instrumentation.block_entities.metrics_enabled", "true");
++        
++        // Threaded broadcasting - ENABLED by default
++        m.put("broadcasting.threaded.enabled", "true");
++        m.put("broadcasting.threaded.maxBatchesPerQueue", "128");
++        m.put("broadcasting.threaded.perTickDrainBudget", "256");
++        m.put("broadcasting.threaded.maxQueuesTotal", "50000");
++        m.put("broadcasting.threaded.dropPolicy", "coalesce");
++        m.put("broadcasting.threaded.debug", "false"); // debug = false
++        
++        // Tracking caps
+         m.put("tracking.max_trackers_per_entity", "0");
+         m.put("tracking.max_trackers_heavy", "0");
+         m.put("tracking.heavy_types", "ITEM,PROJECTILE");
+-        // Pathfinding recalculation (default-off)
+-        m.put("pathfinding.recalc.enabled", "false");
++        
++        // Pathfinding recalculation - ENABLED by default
++        m.put("pathfinding.recalc.enabled", "true");
+         m.put("pathfinding.recalc.minIntervalTicks", "5");
+         m.put("pathfinding.recalc.jitterTicks", "2");
+-        m.put("pathfinding.recalc.debug", "false");
+-        // Villager sensors throttle (default-off)
+-        m.put("villagers.sensors.throttle.enabled", "false");
++        m.put("pathfinding.recalc.debug", "false"); // debug = false
++        
++        // Villager sensors throttle - ENABLED by default
++        m.put("villagers.sensors.throttle.enabled", "true");
+         m.put("villagers.sensors.throttle.minIntervalTicks", "10");
+         m.put("villagers.sensors.throttle.jitterTicks", "2");
+-        m.put("villagers.sensors.debug", "false");
+-        // Fairness budgets (default-off)
+-        m.put("fairness.enabled", "false");
+-        m.put("fairness.broadcastDrain.budget", "64");
++        m.put("villagers.sensors.debug", "false"); // debug = false
++        
++        // Fairness budgets - ENABLED by default
++        m.put("fairness.enabled", "true");
++        m.put("fairness.broadcastDrain.budget", "512");
+         m.put("fairness.diagnosticsDrain.budget", "32");
+         m.put("fairness.asyncCompletions.budget", "64");
+-        m.put("fairness.debug", "false");
++        m.put("fairness.debug", "false"); // debug = false
++        
++        // Prefetch
++        m.put("prefetch.enabled", "true");
++        m.put("prefetch.steps", "2");
++        m.put("prefetch.max_per_tick", "4");
++        m.put("prefetch.min_speed_blocks_per_tick", "0.05");
++        
+         return m;
+     }
+ 
+     // Broadcasting getters
+-    public boolean broadcastingThreadedEnabled() { return getBoolean("broadcasting.threaded.enabled", false); }
+-    public int broadcastingThreadedMaxQueuesTotal() { return Math.max(1, getInt("broadcasting.threaded.maxQueuesTotal", 20000)); }
+-    public int broadcastingThreadedMaxBatchesPerQueue() { return Math.max(1, getInt("broadcasting.threaded.maxBatchesPerQueue", 64)); }
++    public boolean broadcastingThreadedEnabled() { return getBoolean("broadcasting.threaded.enabled", true); }
++    public int broadcastingThreadedMaxQueuesTotal() { return Math.max(1, getInt("broadcasting.threaded.maxQueuesTotal", 50000)); }
++    public int broadcastingThreadedMaxBatchesPerQueue() { return Math.max(1, getInt("broadcasting.threaded.maxBatchesPerQueue", 128)); }
+     public String broadcastingThreadedDropPolicyRaw() { return getString("broadcasting.threaded.dropPolicy", "coalesce"); }
+-    public int broadcastingThreadedDrainBudget() { return Math.max(1, getInt("broadcasting.threaded.perTickDrainBudget", 4)); }
++    public int broadcastingThreadedDrainBudget() { return Math.max(1, getInt("broadcasting.threaded.perTickDrainBudget", 256)); }
+ 
+     // Pathfinding recalculation getters
+-    public boolean pathfindingRecalcEnabled() { return getBoolean("pathfinding.recalc.enabled", false); }
++    public boolean pathfindingRecalcEnabled() { return getBoolean("pathfinding.recalc.enabled", true); }
+     public int pathfindingRecalcMinIntervalTicks() { return Math.max(0, getInt("pathfinding.recalc.minIntervalTicks", 5)); }
+     public int pathfindingRecalcJitterTicks() { return Math.max(0, getInt("pathfinding.recalc.jitterTicks", 2)); }
+     public boolean pathfindingRecalcDebug() { return getBoolean("pathfinding.recalc.debug", false); }
+ 
+     // Villager sensors throttle getters
+-    public boolean villagerSensorsThrottleEnabled() { return getBoolean("villagers.sensors.throttle.enabled", false); }
++    public boolean villagerSensorsThrottleEnabled() { return getBoolean("villagers.sensors.throttle.enabled", true); }
+     public int villagerSensorsThrottleMinIntervalTicks() { return Math.max(0, getInt("villagers.sensors.throttle.minIntervalTicks", 10)); }
+     public int villagerSensorsThrottleJitterTicks() { return Math.max(0, getInt("villagers.sensors.throttle.jitterTicks", 2)); }
+     public boolean villagerSensorsDebug() { return getBoolean("villagers.sensors.debug", false); }
+ 
+     // Fairness getters
+-    public boolean fairnessEnabled() { return getBoolean("fairness.enabled", false); }
+-    public int fairnessBroadcastDrainBudget() { return Math.max(1, getInt("fairness.broadcastDrain.budget", 64)); }
++    public boolean fairnessEnabled() { return getBoolean("fairness.enabled", true); }
++    public int fairnessBroadcastDrainBudget() { return Math.max(1, getInt("fairness.broadcastDrain.budget", 512)); }
+     public int fairnessDiagnosticsDrainBudget() { return Math.max(1, getInt("fairness.diagnosticsDrain.budget", 32)); }
+     public int fairnessAsyncCompletionsBudget() { return Math.max(1, getInt("fairness.asyncCompletions.budget", 64)); }
+     public boolean fairnessDebug() { return getBoolean("fairness.debug", false); }
+ 
+     // Tracker coalescing getters
+-    public boolean trackerCoalesceEnabled() { return getBoolean("entities.tracker.coalesce.enabled", false); }
++    public boolean trackerCoalesceEnabled() { return getBoolean("entities.tracker.coalesce.enabled", true); }
+     public int trackerCoalesceFarDistance() { return Math.max(1, getInt("entities.tracker.coalesce.farDistance", 96)); }
+-    public int trackerCoalesceInterval() { return Math.max(1, getInt("entities.tracker.coalesce.interval", 3)); }
+-    public int trackerViewerHysteresisBlocks() { return Math.max(0, getInt("entities.tracker.hysteresis.blocks", 24)); }
++    public int trackerCoalesceInterval() { return Math.max(1, getInt("entities.tracker.coalesce.interval", 4)); }
++    public int trackerViewerHysteresisBlocks() { return Math.max(0, getInt("entities.tracker.hysteresis.blocks", 32)); }
+ 
+     // Spawn pressure getters
+-    public boolean spawnPressureEnabled() { return getBoolean("spawning.mob_pressure.enabled", false); }
+-    public int spawnPressureLimitPercent() { return Math.max(0, Math.min(100, getInt("spawning.mob_pressure.per_category_limit_percent", 100))); }
+-    public int spawnPressureMaxGroupsPerPos() { return Math.max(1, getInt("spawning.mob_pressure.max_groups_per_pos", 3)); }
+-    public int spawnPressureMaxAttemptsPerGroup() { return Math.max(1, getInt("spawning.mob_pressure.max_attempts_per_group", 4)); }
++    public boolean spawnPressureEnabled() { return getBoolean("spawning.mob_pressure.enabled", true); }
++    public int spawnPressureLimitPercent() { return Math.max(0, Math.min(100, getInt("spawning.mob_pressure.per_category_limit_percent", 70))); }
++    public int spawnPressureMaxGroupsPerPos() { return Math.max(1, getInt("spawning.mob_pressure.max_groups_per_pos", 2)); }
++    public int spawnPressureMaxAttemptsPerGroup() { return Math.max(1, getInt("spawning.mob_pressure.max_attempts_per_group", 2)); }
+ }
