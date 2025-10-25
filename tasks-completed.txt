@@ -59,3 +59,165 @@ HerculiPaper — Tasks Completed
   - Main-thread drain loop wired via PlayerList.tick() calling BroadcastRegistry.drainOnMainTick(server) with per-tick budget.
   - Queue metrics enhanced: enq/deq rates (per second) and drain budget surfaced in /herculi queues.
   - Recipient queue manager sends batches directly to each player's connection; queues cleaned lazily when recipients disappear.
+
+3) Async chunk IO + light pipeline
+  - DONE Prefetch scaffold: HerculiChunkPipeline.prefetchChunk
+  - DONE Wire minimal async read stage behind config gate
+4) Entity scheduler & handoff
+ - DONE Scaffold: EntityRegionScheduler.execute/supply (region-affine, gated)
+ - DONE Identify low-risk hook points (no behavior change; default-off)
+  - DONE Candidate list & risk assessment doc
+  - DONE Handoff: non-gameplay-critical emissions (particles/sounds) to region scheduler
+  - DONE Handoff: entity tracker packet emissions within region (ensure ordering)
+  - DONE Add basic debug logging to confirm when sound/particle handoffs occur
+ - DONE Expose region executor metrics in `/herculi queues` (activeExecutors, enqueued, executed, inFlight)
+ - DONE Region executor idle cleanup policy (configurable)
+ - DONE Research: pathfinding recalculation scheduling (risk: medium) — behind separate gate
+   - docs/pathfinding-recalc-design.md
+ - DONE Research: villager sensor scans throttling (risk: medium) — behind separate gate
+   - docs/villager-sensors-throttle-design.md
+5) WIP Network pipeline fencing (default-off)
+ - DONE Phase 0 scaffolding: config gates + NetworkFence utility + docs
+ - DONE Phase 1: instrument choke points with hooks (no behavior change)
+ - DONE Phase 2: per-recipient fencing/queue design (default-off)
+   - Implemented via 0067-BroadcastPacketEvent scaffolding: RecipientQueueKey/Queue/Manager, config gates, and initial wiring in CraftPlayer#sendMultiBlockChange (default-off)
+7) Timing budgets & fairness  
+8) Config flags & rollout controls
+9) Instrumentation & profiling
+10) 0032-End-Gateways.patch
+ - DONE Portal & End Gateway parity
+11) 0033-Block-events.patch DONE
+17) 0011-Player.patch DONE
+21) 0015-mpmap-debug-command.patch
+24) 0018-Block-entities.patch
+ - WIP Instrumentation & micro-optimizations
+  - Instrumentation: gated block entity tick metrics + /herculi probe exposure (applied)
+25) 0019-Multithreaded-WeakSeqLock.patch DONE
+25.5) 0021-TrackedEntity.patch DONE
+30) 0026-Run-unsupported-plugins-in-sync.patch
+ - TODO Gate a main-thread fallback path for unsupported plugin actions touching world/chunks
+  - Acceptance: no crashes from cross-thread access; minimal overhead when disabled
+31) 0027-Thread-safe-AreaMap.patch DONE
+ - Fast snapshot/foreach helpers in NearbyPlayers (snapshotPlayersByChunk, forEachByChunk)
+ - Primary call sites already using allocation-free iteration against ReferenceList
+ - Acceptance: no CME observed; unchanged results
+33) 0034-Add-various-API-for-Folia-plugin-compatibility.patch
+ - DONE Expose minimal APIs needed by common Folia-aware plugins (isFoliaSupported, RegionizedServerInitEvent, isGlobalTickThread)
+34) 0035-allow-unsupported-plugins-to-modify-chunks-via-global-scheduler.patch
+ - TODO Verify unsupported plugins via global scheduler coverage
+  - Acceptance: Document current coverage (VanillaCommandWrapper/HerculiSync); add cases for common plugin actions touching chunks; ensure main-thread fallback.
+35) 0036-Entity-retirement-debug-log.patch
+43) 0044-Plugin-not-folia-supported-warning.patch
+ - TODO Add clear runtime warning for non-Folia-aware plugins; link to docs
+  - Acceptance: single warning per plugin; gate to disable if noisy.
+46) 0049-PotentialCalculator.patch
+ - TODO Thread-safe potential calculations; cache/snapshot where beneficial
+54) 0057-Fix-test-failures-and-add-null-safety-checks.patch
+55) 0058-Fix-EntityRemoveEventTest-by-adding-missing-Bukkit-remove-cause.patch
+
+
+// === New Tasks: Region handoffs & diagnostics ===
+- DONE Regionized emissions handoff
+ - Subtasks
+  - DONE Particles handoff: wrap CraftWorld/ServerLevel particle sends via RegionSchedulers.executeForThenMain (gate: threading.handoff.particles)
+  - DONE Tracker packets handoff: in ChunkMap.TrackedEntity.updatePlayer route initial pairing packets via RegionSchedulers.executeForThenMain (gate: threading.handoff.tracker_packets)
+  - DONE Broadcast drain tick: ensure PlayerList.tick drains BroadcastRegistry each tick and verify metrics exposure
+  - DONE RegionSchedulers debug: add first-use per-region debug logs when threading.debug is true
+
+// === Profiling/Diagnostics Commands ===
+- TODO Add profiling/diagnostics commands
+  - Subtasks
+    - DONE `/herculi profile start|stop` (record timings/JFR hooks)
+    - DONE `/herculi locks` (dump contention snapshot)
+    - DONE `/herculi queues` (show region queues/back pressure)
+    - DONE Add tab-complete for `/herculi` (profile/locks/queues/reload)
+
+- WIP Craft marshalling refinement: for give/clear, marshal per-target player region when behavior toggles on
+ - Subtasks
+  - DONE Identify and wrap commands affecting player inventory/state
+   - DONE give (GiveCommand)
+   - DONE xp/experience (ExperienceCommand)
+   - DONE clear (ClearInventoryCommands)
+   - DONE enchant (EnchantCommand)
+   - DONE Fix EnchantCommand success reporting under marshalling
+  - DONE Route via global/region scheduler per target player region (no behavior change)
+  - DONE Add config gate `commands.marshalPerTarget` (default-off)
+  - DONE Create helper `CommandMarshal.forPlayer(target, runnable)` for Phase 1
+
+tasks-completed:
+1) Scheduler backbone (regionized executors) DONE
+ - DONE Per-region StampedLock map behind config gate
+ - DONE acquireRead/acquireWrite APIs returning RegionLock
+ - DONE Deterministic neighborhood write-lock acquisition (square radius)
+ - DONE Shutdown: clear region lock map; JVM shutdown hook
+ - DONE Neighbor read-lock helpers
+ - DONE Contention metrics snapshot
+2) Region grid & lock manager DONE
+ - DONE Per-region StampedLock map behind config gate
+ - DONE acquireRead/acquireWrite APIs returning RegionLock
+ - DONE Deterministic neighborhood write-lock acquisition (square radius)
+ - DONE Shutdown: clear region lock map; JVM shutdown hook
+ - DONE Neighbor read-lock helpers
+ - DONE Contention metrics snapshot
+6) Event dispatch guardrails DONE
+13) 0051-Bukkit-API-thread-checks.patch DONE
+ - Guards added: CraftServer.dispatchCommand; CraftPlayer.performCommand/chat/kick*; CraftChunk.getHandle; CraftWorld.getChunkAt; CraftBlock.getNMS/getData/setBlockState/getType
+14) 0063-Optimization-Parallelization.patch DONE
+15) 0007-Thread-safe-random.patch DONE
+ - LegacyRandomSource: setSeed uses atomic set + gaussian reset; next(int) uses CAS loop; no ThreadingDetector throw (mirrors ShreddedPaper intent)
+16) 0008-Thread-safe-NeigbhorUpdater.patch DONE
+ - Level.neighborUpdater uses PerThreadNeighborUpdater(ThreadLocal CollectingNeighborUpdater)
+18) 0012-Level-ticks.patch DONE
+19) 0013-Custom-spawners.patch DONE
+20) 0014-Chunk-unloading.patch DONE
+22) 0016-EntityLookup-accessibleEntities.patch DONE
+23) 0017-World-gen.patch DONE
+26) 0022-Thread-safe-navigatingMobs.patch DONE
+27) 0023-entityMap-thread-safety.patch DONE
+28) 0024-Misc-threadsafety.patch DONE
+ - DONE Harden PlayerTeam.players and ChunkMap.TrackedEntity.seenBy to thread-safe sets
+ - DONE Audit packet-broadcast loops for snapshot iteration (ChunkHolder.broadcast safe)
+ - DONE Audit scoreboard/team mutation paths (Scoreboard concurrent maps; PlayerTeam.players concurrent)
+29) 0025-NearbyPlayers.patch DONE
+30.5) 0028-Threaded-chunk-changes-broadcasting.patch DONE
+32) 0029-ThreadLocals-for-block-state-capturing.patch DONE
+28) 0024-Misc-threadsafety.patch
+ - DONE Harden PlayerTeam.players to thread-safe set (ConcurrentHashMap-backed)
+ - DONE Harden ChunkMap.TrackedEntity.seenBy to thread-safe concurrent set
+ - DONE Audit packet-broadcast loops for snapshot iteration where needed (ChunkHolder.broadcast uses snapshot list; safe)
+ - DONE Audit scoreboard/team mutation call sites (Scoreboard maps already concurrent or localized to main thread; PlayerTeam.players concurrent)
+33) 0030-Portal.patch DONE
+34) 0031-Ender-dragon-fight.patch DONE
+36) 0037-Raids.patch DONE
+37) 0038-Thread-safe-alternate-redstone-handler.patch DONE
+38) 0039-Thread-safe-redstoneUpdateInfos.patch DONE
+39) 0040-Thread-safe-chunksBeingWorkedOn.patch DONE
+40) 0041-kill-command.patch DONE
+41) 0042-Purpur-teleportIfOutsideBorder-use-teleportAsync.patch DONE
+42) 0043-Ensure-worlds-are-loaded-on-the-global-scheduler.patch DONE
+44) 0046-Optimization-entity-activation-check-frequency.patch DONE
+45) 0047-handlingTick.patch DONE
+46) 0049-PotentialCalculator.patch DONE
+47) 0050-Remove-firework-rocket-if-entity-teleported-away.patch DONE
+48) 0054-Send-ping-packet-later.patch DONE
+49) 0055-Moving-into-another-region.patch DONE
+50) 0056-Don't-allow-actions-outside-of-our-region.patch DONE
+57) 0060-Optimization-vanish-api.patch DONE
+58) 0061-Optimization-Use-lazyExecute-if-we-aren't-flushing.patch DONE
+60) 0064-Optimization-maximum-trackers-per-entity.patch DONE
+61) 0065-Optimization-Cache-chunk-packets.patch DONE
+63) 0067-BroadcastPacketEvent.patch DONE
+64) 0068-Optimization-Write-player-saves-async.patch DONE
+65) 0034-Add-various-API-for-Folia-plugin-compatibility.patch DONE
+66) Add testing subcommands: thread, sound, particle DONE
+ - Create Herculi server configuration file `herculi.yml` and wire feature gates DONE
+ - DONE Auto-merge missing `herculi.yml` keys on startup/reload
+67) Performance: Cache HerculiConfig flags in hot paths (ChunkMap, ServerGamePacketListenerImpl) DONE
+68) Performance: Cache isChunkNearPlayer/collectSpawningChunks via player-near bitset DONE
+69) Performance: TicketStorage.purgeStaleTickets incremental purge DONE
+70) Performance: Improve chunk-packet cache hit rate DONE
+71) Tracker churn: tick-stamped vanish cache and distance hysteresis DONE
+72) Fast membership map for viewers in ChunkMap$TrackedEntity DONE
+73) Performance: Replace CHM vanish cache with fastutil Object2LongOpenHashMap DONE
+74) Performance: Batch viewer array rebuilds to reduce overhead DONE
+75) Performance: AI tick throttling for far entities DONE
