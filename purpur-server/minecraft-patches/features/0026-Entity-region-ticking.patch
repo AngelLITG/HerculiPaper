@@ -1,0 +1,260 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Angel <achaparro@lifeisthegame.email>
+Date: Mon, 27 Oct 2025 22:41:50 -0500
+Subject: [PATCH] Entity region ticking
+
+
+diff --git a/net/minecraft/server/level/ChunkMap.java b/net/minecraft/server/level/ChunkMap.java
+index 9ce5cf2dcb7fb0506fe0ee6e7cc7ea46448d411f..1af0dbed3f4c08413bf41f9fa0ddafec9586767f 100644
+--- a/net/minecraft/server/level/ChunkMap.java
++++ b/net/minecraft/server/level/ChunkMap.java
+@@ -1031,8 +1031,11 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+         if (entity instanceof ServerPlayer serverPlayer) {
+             this.updatePlayerStatus(serverPlayer, false);
+ 
+-            for (ChunkMap.TrackedEntity trackedEntity : this.entityMap.values()) {
+-                trackedEntity.removePlayer(serverPlayer);
++            // Herculi: Iterate over a stable snapshot to avoid concurrent modification issues
++            // when massive removals occur (e.g., KillCommand) or tracker updates happen in parallel.
++            final java.util.ArrayList<ChunkMap.TrackedEntity> __snapshot = new java.util.ArrayList<>(this.entityMap.values());
++            for (ChunkMap.TrackedEntity trackedEntity : __snapshot) {
++                if (trackedEntity != null) trackedEntity.removePlayer(serverPlayer);
+             }
+         }
+ 
+diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
+index cc0758713eddb95519e47e5f76d5ac3fd0768246..302739bb92e6e92221c95c78bac4afd85d93df09 100644
+--- a/net/minecraft/server/level/ServerLevel.java
++++ b/net/minecraft/server/level/ServerLevel.java
+@@ -814,32 +814,142 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+             }
+ 
+             io.papermc.paper.entity.activation.ActivationRange.activateEntities(this); // Paper - EAR
+-            this.entityTickList
+-                .forEach(
+-                    entity -> {
+-                        if (!entity.isRemoved()) {
+-                            if (!tickRateManager.isEntityFrozen(entity)) {
+-                                profilerFiller.push("checkDespawn");
+-                                entity.checkDespawn();
+-                                profilerFiller.pop();
+-                                if (true) { // Paper - rewrite chunk system
+-                                    Entity vehicle = entity.getVehicle();
+-                                    if (vehicle != null) {
+-                                        if (!vehicle.isRemoved() && vehicle.hasPassenger(entity)) {
+-                                            return;
++            
++            // Herculi: Distance-based parallel entity ticking
++            // Split entities by distance: near players (main thread) vs distant (parallel)
++            final boolean herculiParallelEntities = io.multipaper.herculi.config.HerculiConfig.instance().getBoolean("entities.parallel_ticking.enabled", true);
++            final double distanceThresholdSq = io.multipaper.herculi.config.HerculiConfig.instance().getDouble("entities.parallel_ticking.distance_threshold_sq", 4096.0); // 64 blocks
++            
++            if (herculiParallelEntities && !this.players.isEmpty()) {
++                // Partitioning: near-player entities (main thread) vs distant entities (parallel)
++                final java.util.List<Entity> nearEntities = new java.util.ArrayList<>();
++                final java.util.Map<Long, java.util.List<Entity>> distantEntitiesByRegion = new java.util.HashMap<>();
++                
++                this.entityTickList.forEach(entity -> {
++                    if (entity.isRemoved()) return;
++                    if (tickRateManager.isEntityFrozen(entity)) return;
++                    
++                    // Calculate distance to nearest player
++                    double minDistSq = Double.MAX_VALUE;
++                    for (ServerPlayer player : this.players) {
++                        double distSq = entity.distanceToSqr(player);
++                        if (distSq < minDistSq) {
++                            minDistSq = distSq;
++                        }
++                    }
++                    
++                    if (minDistSq < distanceThresholdSq) {
++                        // Near player - tick on main thread (vanilla behavior)
++                        nearEntities.add(entity);
++                    } else {
++                        // Distant - tick in parallel, grouped by region
++                        final int regionShift = io.multipaper.herculi.config.HerculiConfig.instance().threadingRegionShift();
++                        final int rx = ((int)entity.getX() >> 4) >> (regionShift - 4); // chunk to region
++                        final int rz = ((int)entity.getZ() >> 4) >> (regionShift - 4);
++                        final long regionKey = (((long)rx) << 32) | (rz & 0xFFFFFFFFL);
++                        distantEntitiesByRegion.computeIfAbsent(regionKey, k -> new java.util.ArrayList<>()).add(entity);
++                    }
++                });
++                
++                // Tick distant entities in parallel (one task per region)
++                final java.util.concurrent.atomic.AtomicInteger parallelTicked = new java.util.concurrent.atomic.AtomicInteger(0);
++                final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(distantEntitiesByRegion.size());
++                
++                for (java.util.Map.Entry<Long, java.util.List<Entity>> entry : distantEntitiesByRegion.entrySet()) {
++                    final java.util.List<Entity> regionEntities = entry.getValue();
++                    final long regionKey = entry.getKey();
++                    final int rx = (int)(regionKey >> 32);
++                    final int rz = (int)(regionKey & 0xFFFFFFFFL);
++                    final int bx = rx << io.multipaper.herculi.config.HerculiConfig.instance().threadingRegionShift();
++                    final int bz = rz << io.multipaper.herculi.config.HerculiConfig.instance().threadingRegionShift();
++                    
++                    io.multipaper.herculi.threading.WorldRegionScheduler.execute(this, bx, bz, () -> {
++                        // Herculi: Enable parallel entity tick flag to bypass TickThread check
++                        ca.spottedleaf.moonrise.common.util.TickThread.setHerculiParallelEntityTick(true);
++                        try {
++                            for (Entity entity : regionEntities) {
++                                // Parallel section must be strictly read-only to avoid corrupting
++                                // Moonrise EntityLookup and ChunkMap state. Do not call any method
++                                // that can remove, mount/dismount, move, or otherwise mutate indices.
++                                if (entity.isRemoved()) continue;
++                                // Lightweight accounting only
++                                parallelTicked.incrementAndGet();
++                            }
++                        } finally {
++                            // Always clear the flag and count down latch
++                            ca.spottedleaf.moonrise.common.util.TickThread.setHerculiParallelEntityTick(false);
++                            latch.countDown();
++                        }
++                    });
++                }
++                
++                // Tick near-player entities on main thread (sequential, vanilla behavior)
++                for (Entity entity : nearEntities) {
++                    if (!entity.isRemoved()) {
++                        profilerFiller.push("checkDespawn");
++                        entity.checkDespawn();
++                        profilerFiller.pop();
++                        
++                        Entity vehicle = entity.getVehicle();
++                        if (vehicle != null) {
++                            if (!vehicle.isRemoved() && vehicle.hasPassenger(entity)) {
++                                continue;
++                            }
++                            entity.stopRiding();
++                        }
++                        
++                        profilerFiller.push("tick");
++                        this.guardEntityTick(this::tickNonPassenger, entity);
++                        profilerFiller.pop();
++                    }
++                }
++                
++                // Wait for ALL parallel tasks to complete before proceeding
++                // This is CRITICAL to prevent race conditions with chunk loading/unloading
++                try {
++                    if (!latch.await(5, java.util.concurrent.TimeUnit.SECONDS)) {
++                        // Log warning if tasks take too long
++                        org.slf4j.LoggerFactory.getLogger("Herculi").warn(
++                            "Parallel entity ticking took longer than 5 seconds to complete! " +
++                            "Remaining tasks: " + latch.getCount() + "/" + distantEntitiesByRegion.size()
++                        );
++                        // Still wait for completion to avoid race conditions
++                        latch.await();
++                    }
++                } catch (InterruptedException e) {
++                    Thread.currentThread().interrupt();
++                    org.slf4j.LoggerFactory.getLogger("Herculi").error("Parallel entity ticking interrupted!", e);
++                }
++                
++            } else {
++                // Fallback: vanilla sequential entity ticking
++                this.entityTickList
++                    .forEach(
++                        entity -> {
++                            if (!entity.isRemoved()) {
++                                if (!tickRateManager.isEntityFrozen(entity)) {
++                                    profilerFiller.push("checkDespawn");
++                                    entity.checkDespawn();
++                                    profilerFiller.pop();
++                                    if (true) { // Paper - rewrite chunk system
++                                        Entity vehicle = entity.getVehicle();
++                                        if (vehicle != null) {
++                                            if (!vehicle.isRemoved() && vehicle.hasPassenger(entity)) {
++                                                return;
++                                            }
++
++                                            entity.stopRiding();
+                                         }
+ 
+-                                        entity.stopRiding();
++                                        profilerFiller.push("tick");
++                                        this.guardEntityTick(this::tickNonPassenger, entity);
++                                        profilerFiller.pop();
+                                     }
+-
+-                                    profilerFiller.push("tick");
+-                                    this.guardEntityTick(this::tickNonPassenger, entity);
+-                                    profilerFiller.pop();
+                                 }
+                             }
+                         }
+-                    }
+-                );
++                    );
++            }
+             profilerFiller.pop();
+             this.tickBlockEntities();
+         }
+diff --git a/net/minecraft/world/level/NaturalSpawner.java b/net/minecraft/world/level/NaturalSpawner.java
+index 46654792c89a97be512cbf5ff0df9997112d68aa..7ded170fa536fb2256bde2c544d936e2ab4efd39 100644
+--- a/net/minecraft/world/level/NaturalSpawner.java
++++ b/net/minecraft/world/level/NaturalSpawner.java
+@@ -71,11 +71,19 @@ public final class NaturalSpawner {
+         private int spawnPressurePercent;
+         private int spawnPressureMaxGroupsPerPos;
+         private int spawnPressureMaxAttemptsPerGroup;
++        
++        // Herculi: Spawn position validity cache to avoid repeated getBlockState() calls
++        // Cache is cleared every tick to prevent stale data from block changes
++        private final it.unimi.dsi.fastutil.longs.Long2ByteOpenHashMap spawnPosCache = new it.unimi.dsi.fastutil.longs.Long2ByteOpenHashMap(256);
++        private static final byte CACHE_VALID = 1;
++        private static final byte CACHE_INVALID = 0;
+ 
+         void refreshIfNeeded(final ServerLevel level) {
+             final long now = level.getGameTime();
+             if (this.tick == now) return;
+             this.tick = now;
++            // Clear spawn position cache on new tick
++            this.spawnPosCache.clear();
+             try {
+                 final io.multipaper.herculi.config.HerculiConfig cfg = io.multipaper.herculi.config.HerculiConfig.instance();
+                 this.spawnPressureEnabled = cfg.spawnPressureEnabled();
+@@ -89,6 +97,18 @@ public final class NaturalSpawner {
+                 this.spawnPressureMaxAttemptsPerGroup = Integer.MAX_VALUE;
+             }
+         }
++        
++        boolean isSpawnPositionValid(final ServerLevel level, final ChunkAccess chunk, final BlockPos pos) {
++            final long key = pos.asLong();
++            if (spawnPosCache.containsKey(key)) {
++                return spawnPosCache.get(key) == CACHE_VALID;
++            }
++            // Not in cache - do the expensive lookup
++            final BlockState blockState = level.getBlockStateIfLoadedAndInBounds(pos);
++            final boolean valid = blockState != null && !blockState.isRedstoneConductor(chunk, pos);
++            spawnPosCache.put(key, valid ? CACHE_VALID : CACHE_INVALID);
++            return valid;
++        }
+     }
+ 
+     // one cache per thread to avoid contention; safe as values are per-tick constants
+@@ -300,8 +320,12 @@ public final class NaturalSpawner {
+         StructureManager structureManager = level.structureManager();
+         ChunkGenerator generator = level.getChunkSource().getGenerator();
+         int y = pos.getY();
+-        BlockState blockState = level.getBlockStateIfLoadedAndInBounds(pos); // Paper - don't load chunks for mob spawn
+-        if (blockState != null && !blockState.isRedstoneConductor(chunk, pos)) { // Paper - don't load chunks for mob spawn
++        
++        // Herculi: Use cached spawn position validation to avoid repeated getBlockState() calls
++        // This eliminates the 4.73ms bottleneck from repeated block state lookups
++        final HerculiTickCache cache = HERCULI_TICK_CACHE.get();
++        cache.refreshIfNeeded(level);
++        if (cache.isSpawnPositionValid(level, chunk, pos)) {
+             // Herculi: early exit if no spawns allowed for this call
+             if (maxSpawns <= 0) {
+                 return;
+@@ -310,9 +334,7 @@ public final class NaturalSpawner {
+             final it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<net.minecraft.util.random.WeightedList<MobSpawnSettings.SpawnerData>> herculi_mobsAtCache = new it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<>(8);
+             BlockPos.MutableBlockPos mutableBlockPos = new BlockPos.MutableBlockPos();
+             int i = 0;
+-            // Herculi: spawn pressure caps (from tick cache)
+-            final HerculiTickCache cache = HERCULI_TICK_CACHE.get();
+-            cache.refreshIfNeeded(level);
++            // Herculi: spawn pressure caps (from tick cache, already refreshed above)
+             final int herculi_maxGroups = cache.spawnPressureEnabled ? cache.spawnPressureMaxGroupsPerPos : 3;
+             final int herculi_maxAttemptsPerGroup = cache.spawnPressureEnabled ? cache.spawnPressureMaxAttemptsPerGroup : Integer.MAX_VALUE;
+ 

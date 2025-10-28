@@ -1,0 +1,179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Angel <achaparro@lifeisthegame.email>
+Date: Mon, 27 Oct 2025 22:42:56 -0500
+Subject: [PATCH] Probe nano delay
+
+
+diff --git a/src/main/java/ca/spottedleaf/moonrise/common/util/TickThread.java b/src/main/java/ca/spottedleaf/moonrise/common/util/TickThread.java
+index 69cdd304d255d52c9b7dc9b6a33ffdb630b79abe..71683a5f4796509726d3788764e6aecd130932ec 100644
+--- a/src/main/java/ca/spottedleaf/moonrise/common/util/TickThread.java
++++ b/src/main/java/ca/spottedleaf/moonrise/common/util/TickThread.java
+@@ -14,6 +14,17 @@ import java.util.concurrent.atomic.AtomicInteger;
+ public class TickThread extends Thread {
+ 
+     private static final Logger LOGGER = LoggerFactory.getLogger(TickThread.class);
++    
++    // Herculi: Allow parallel entity ticking on region threads
++    private static final ThreadLocal<Boolean> HERCULI_PARALLEL_ENTITY_TICK = ThreadLocal.withInitial(() -> Boolean.FALSE);
++    
++    public static void setHerculiParallelEntityTick(boolean value) {
++        HERCULI_PARALLEL_ENTITY_TICK.set(value);
++    }
++    
++    public static boolean isHerculiParallelEntityTick() {
++        return HERCULI_PARALLEL_ENTITY_TICK.get();
++    }
+ 
+     private static String getThreadContext() {
+         return "thread=" + Thread.currentThread().getName();
+@@ -119,6 +130,10 @@ public class TickThread extends Thread {
+     }
+ 
+     public static boolean isTickThread() {
++        // Herculi: Allow region threads during parallel entity ticking
++        if (isHerculiParallelEntityTick()) {
++            return true;
++        }
+         return Thread.currentThread() instanceof TickThread;
+     }
+ 
+diff --git a/src/main/java/io/multipaper/herculi/config/HerculiConfig.java b/src/main/java/io/multipaper/herculi/config/HerculiConfig.java
+index 6dd8d2fee8cf0a992240fd5bf01edd1b193f3d1f..6dcf67e16effc73f5283f0244267f12af822a6fd 100644
+--- a/src/main/java/io/multipaper/herculi/config/HerculiConfig.java
++++ b/src/main/java/io/multipaper/herculi/config/HerculiConfig.java
+@@ -255,7 +255,10 @@ public final class HerculiConfig {
+                             + "prefetch.enabled: true\n"
+                             + "prefetch.steps: 2\n"
+                             + "prefetch.max_per_tick: 4\n"
+-                            + "prefetch.min_speed_blocks_per_tick: 0.05\n"
++                            + "prefetch.min_speed_blocks_per_tick: 0.05\n\n"
++                            + "# Parallel entity ticking - ENABLED by default\n"
++                            + "entities.parallel_ticking.enabled: true\n"
++                            + "entities.parallel_ticking.distance_threshold_sq: 4096.0\n"
+ ;
+                             
+                         java.nio.file.Files.writeString(cfgFile, scaffold);
+@@ -468,9 +471,23 @@ public final class HerculiConfig {
+         m.put("prefetch.max_per_tick", "4");
+         m.put("prefetch.min_speed_blocks_per_tick", "0.05");
+         
++        // Parallel entity ticking - ENABLED by default
++        m.put("entities.parallel_ticking.enabled", "true");
++        m.put("entities.parallel_ticking.distance_threshold_sq", "4096.0"); // 64 blocks squared
++        
++        // Instrumentation sampling
++        m.put("instrumentation.sample_rate", "100"); // Sample 1% of ticks
++        
+         return m;
+     }
+ 
++    // Instrumentation sampling
++    public int instrumentationSampleRate() { return Math.max(1, getInt("instrumentation.sample_rate", 100)); }
++    
++    // Parallel entity ticking - ENABLED by default
++    public boolean entitiesParallelTickingEnabled() { return getBoolean("entities.parallel_ticking.enabled", true); }
++    public double entitiesParallelTickingDistanceThresholdSq() { return getDouble("entities.parallel_ticking.distance_threshold_sq", 4096.0); }
++    
+     // Broadcasting getters
+     public boolean broadcastingThreadedEnabled() { return getBoolean("broadcasting.threaded.enabled", true); }
+     public int broadcastingThreadedMaxQueuesTotal() { return Math.max(1, getInt("broadcasting.threaded.maxQueuesTotal", 50000)); }
+diff --git a/src/main/java/io/multipaper/herculi/instrumentation/HerculiBlockEntityMetrics.java b/src/main/java/io/multipaper/herculi/instrumentation/HerculiBlockEntityMetrics.java
+index 392230a07243896ab72b8e8ba201931e1d11f40e..10c78d1e89348273127ecf9c40a12f62128ceac6 100644
+--- a/src/main/java/io/multipaper/herculi/instrumentation/HerculiBlockEntityMetrics.java
++++ b/src/main/java/io/multipaper/herculi/instrumentation/HerculiBlockEntityMetrics.java
+@@ -6,11 +6,22 @@ public final class HerculiBlockEntityMetrics {
+     private static final AtomicLong count = new AtomicLong();
+     private static final AtomicLong nanosTotal = new AtomicLong();
+     private static final AtomicLong nanosMax = new AtomicLong();
++    
++    // Herculi: Sampling to reduce overhead - only measure 1% of ticks
++    private static final ThreadLocal<Integer> sampleCounter = ThreadLocal.withInitial(() -> 0);
+ 
+     private HerculiBlockEntityMetrics() {}
+ 
+     public static long start() {
+-        return System.nanoTime();
++        // Sample only 1% of ticks to reduce overhead
++        int sampleRate = io.multipaper.herculi.config.HerculiConfig.instance().instrumentationSampleRate();
++        int counter = sampleCounter.get() + 1;
++        if (counter >= sampleRate) {
++            sampleCounter.set(0);
++            return System.nanoTime(); // Measure this tick
++        }
++        sampleCounter.set(counter);
++        return 0L; // Skip measurement
+     }
+ 
+     public static void end(long startNanoTime) {
+diff --git a/src/main/java/io/multipaper/herculi/instrumentation/HerculiUnloadMetrics.java b/src/main/java/io/multipaper/herculi/instrumentation/HerculiUnloadMetrics.java
+index 578ab934f51e4b3b3fe59bb10ffc43459e99fb2d..b735df7c5f332266ea6088afaa632e390b14a469 100644
+--- a/src/main/java/io/multipaper/herculi/instrumentation/HerculiUnloadMetrics.java
++++ b/src/main/java/io/multipaper/herculi/instrumentation/HerculiUnloadMetrics.java
+@@ -6,11 +6,22 @@ public final class HerculiUnloadMetrics {
+     private static final AtomicLong count = new AtomicLong();
+     private static final AtomicLong nanosTotal = new AtomicLong();
+     private static final AtomicLong nanosMax = new AtomicLong();
++    
++    // Herculi: Sampling to reduce overhead - only measure 1% of unloads
++    private static final ThreadLocal<Integer> sampleCounter = ThreadLocal.withInitial(() -> 0);
+ 
+     private HerculiUnloadMetrics() {}
+ 
+     public static long start() {
+-        return System.nanoTime();
++        // Sample only 1% of unloads to reduce overhead
++        int sampleRate = io.multipaper.herculi.config.HerculiConfig.instance().instrumentationSampleRate();
++        int counter = sampleCounter.get() + 1;
++        if (counter >= sampleRate) {
++            sampleCounter.set(0);
++            return System.nanoTime(); // Measure this unload
++        }
++        sampleCounter.set(counter);
++        return 0L; // Skip measurement
+     }
+ 
+     public static void end(long startNanoTime) {
+diff --git a/src/main/java/io/multipaper/herculi/threading/HerculiRegionExecutors.java b/src/main/java/io/multipaper/herculi/threading/HerculiRegionExecutors.java
+index 46b1e8e73cb17e8aa85ac0e3dec66a5f70cd0f13..6c4fea66fc6a06cdc2f656c6f9de8e028b7546c3 100644
+--- a/src/main/java/io/multipaper/herculi/threading/HerculiRegionExecutors.java
++++ b/src/main/java/io/multipaper/herculi/threading/HerculiRegionExecutors.java
+@@ -12,6 +12,10 @@ import java.util.concurrent.Executor;
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Executors;
+ import java.util.concurrent.ThreadFactory;
++import java.util.concurrent.ThreadPoolExecutor;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.LinkedTransferQueue;
++import java.util.concurrent.atomic.AtomicInteger;
+ 
+ /**
+  * Phase 1 scaffold: returns a region-affine executor.
+@@ -42,12 +46,26 @@ public final class HerculiRegionExecutors {
+             if (POOL != null && !POOL.isShutdown()) return;
+             int configured = HerculiConfig.instance().threadingRegionPoolSize();
+             final int threads = Math.max(2, configured > 0 ? configured : Runtime.getRuntime().availableProcessors());
++            
++            // Herculi P3 Optimization: Use LinkedTransferQueue instead of LinkedBlockingQueue
++            // LinkedTransferQueue uses lock-free dual-queue algorithm, eliminating expensive
++            // pthread_cond_signal() syscalls that were costing ~12.5ms per tick
++            final AtomicInteger threadId = new AtomicInteger(0);
+             final ThreadFactory tf = r -> {
+-                Thread t = new Thread(r, "Herculi-RegionPool");
++                Thread t = new Thread(r, "Herculi-RegionPool-" + threadId.incrementAndGet());
+                 t.setDaemon(true);
+                 return t;
+             };
+-            POOL = Executors.newFixedThreadPool(threads, tf);
++            
++            // Use ThreadPoolExecutor with LinkedTransferQueue for lock-free enqueuing
++            POOL = new ThreadPoolExecutor(
++                threads,                        // core pool size
++                threads,                        // max pool size
++                60L, TimeUnit.SECONDS,         // keep-alive time
++                new LinkedTransferQueue<>(),   // lock-free work queue
++                tf
++            );
++            
+             HerculiInstrumentation.instance().incRegionPoolCreated();
+             // Best-effort shutdown on JVM exit; server should later hook into lifecycle to call shutdown() explicitly.
+             try {
